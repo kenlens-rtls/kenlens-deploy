@@ -1,0 +1,155 @@
+# KenLens production stack — Story 10.3 (spec §4, D7–D9).
+#
+# Self-contained: run it on its own, from the directory it lives in.
+#
+#   docker compose up -d
+#
+# Three services — kenlens-server, PostgreSQL/TimescaleDB and Mosquitto. No Seq (the server
+# logs to ./logs in Production), no config-executor (a device simulator) and no serial
+# bridge. Development uses the repository-root docker-compose.yml instead; the two share
+# nothing.
+#
+# Every relative path below is relative to this file. Nothing under config/ is shipped:
+# it is generated once per host (Story 10.4, kenlens-setup.sh) and never committed.
+#
+#   config/secrets/  db-password, jwt-key, mqtt-password, cert-password,
+#                    server-cert.pfx (web leaf), db-ca.crt (the KenLens CA)
+#   config/tls/      postgres.crt + postgres.key, mqtt-broker.crt + mqtt-broker.key
+#   config/mosquitto/passwd   user `kenlens`, made with the image's own mosquitto_passwd
+#   config/ca/       the KenLens CA certificate and key — not mounted; keep the key backed up
+#
+# Ownership matters, because the containers run as different users and two of them refuse
+# a key anyone else can read:
+#   - postgres.key: uid 70 (the image's postgres user), mode 0600.
+#   - db-password: uid 70, 0400 — Postgres reads it as uid 70 and the server runs as root.
+#   - mqtt-broker.key + passwd: uid 1883 (the image's mosquitto user), mode 0600.
+#   - everything else in config/secrets/: 0400.
+#
+# One private KenLens CA signs all three leaf certificates (D8), so the server trusts
+# db-ca.crt for Postgres AND for the broker. No reverse proxy (D9): Kestrel terminates web
+# TLS on 8443, Mosquitto terminates MQTT TLS on 8883.
+
+services:
+  postgres:
+    image: timescale/timescaledb:2.18.0-pg17
+    restart: unless-stopped
+    # TLS on, and required: pg_hba.conf has no plain `host` rule, so a network client
+    # that does not negotiate TLS is refused. No host port — the compose network only.
+    command:
+      - postgres
+      - -c
+      - ssl=on
+      - -c
+      - ssl_cert_file=/kenlens/tls/postgres.crt
+      - -c
+      - ssl_key_file=/kenlens/tls/postgres.key
+      - -c
+      - ssl_min_protocol_version=TLSv1.2
+      - -c
+      - hba_file=/kenlens/pg_hba.conf
+    environment:
+      POSTGRES_DB: kenlens
+      POSTGRES_USER: kenlens
+      POSTGRES_PASSWORD_FILE: /run/secrets/db-password
+    volumes:
+      - kenlens-postgres-data:/var/lib/postgresql/data
+      - ./postgres/pg_hba.conf:/kenlens/pg_hba.conf:ro
+      - ./config/tls/postgres.crt:/kenlens/tls/postgres.crt:ro
+      - ./config/tls/postgres.key:/kenlens/tls/postgres.key:ro
+      - ./config/secrets/db-password:/run/secrets/db-password:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U kenlens -d kenlens"]
+      interval: 5s
+      timeout: 3s
+      start_period: 30s
+      retries: 10
+
+  mqtt-broker:
+    image: eclipse-mosquitto:2.0
+    restart: unless-stopped
+    # mosquitto/start.sh writes the broker config at every start: 8883 is TLS + password,
+    # and a 1883 anonymous plain-TCP listener exists only when MQTT_ANONYMOUS_LISTENER=true
+    # (spec D7). 1883 is published either way; with the flag off nothing listens behind it.
+    entrypoint: ["/kenlens/start.sh"]
+    environment:
+      MQTT_ANONYMOUS_LISTENER: ${MQTT_ANONYMOUS_LISTENER:-false}
+    ports:
+      - "8883:8883"
+      - "1883:1883"
+    volumes:
+      - kenlens-mosquitto-data:/mosquitto/data
+      - ./mosquitto/start.sh:/kenlens/start.sh:ro
+      - ./config/tls/mqtt-broker.crt:/kenlens/tls/mqtt-broker.crt:ro
+      - ./config/tls/mqtt-broker.key:/kenlens/tls/mqtt-broker.key:ro
+      - ./config/mosquitto/passwd:/kenlens/passwd:ro
+      # Healthcheck only — the probe below authenticates as the server does.
+      - ./config/secrets/db-ca.crt:/kenlens/tls/ca.crt:ro
+      - ./config/secrets/mqtt-password:/kenlens/mqtt-password:ro
+    healthcheck:
+      # Probes the listener the server uses, with the server's credentials. --insecure
+      # only skips the host-name check (the certificate names mqtt-broker, not localhost);
+      # the chain is still verified against the CA. `$$` keeps `$SYS` and `$(...)` away
+      # from compose interpolation.
+      test:
+        - CMD-SHELL
+        - >-
+          mosquitto_sub -h localhost -p 8883 --cafile /kenlens/tls/ca.crt --insecure
+          -u kenlens -P "$$(cat /kenlens/mqtt-password)" -t '$$SYS/#' -C 1 -W 3
+      interval: 5s
+      timeout: 5s
+      start_period: 10s
+      retries: 10
+
+  kenlens-server:
+    image: ${KENLENS_IMAGE_REPO:-ghcr.io/kenlens-rtls}/kenlens-server:${KENLENS_VERSION:?set KENLENS_VERSION in .env, e.g. v0.1.30}
+    restart: unless-stopped
+    depends_on:
+      postgres:
+        condition: service_healthy
+      mqtt-broker:
+        condition: service_healthy
+    ports:
+      - "8443:8443"
+    environment:
+      ASPNETCORE_ENVIRONMENT: Production
+      # Clear the image's ASPNETCORE_URLS so it cannot override the Kestrel binding in
+      # Program.cs, which enforces TLS 1.2+ and the cipher allow-list (Story 1b.3).
+      ASPNETCORE_URLS: ""
+      Tls__HttpsPort: "8443"
+      Server__Cert__Path: /app/config/secrets/server-cert.pfx
+      # ConnectionStringBuilder assembles Host=postgres from db-password and, in
+      # Production, appends SSL Mode=Require with this file as the root certificate.
+      Db__Ca__Path: /app/config/secrets/db-ca.crt
+      Mqtt__Broker: mqtt-broker
+      Mqtt__Port: "8883"
+      Mqtt__UseTls: "true"
+      Mqtt__CaCertificatePath: /app/config/secrets/db-ca.crt
+      Mqtt__AuthMode: UsernamePassword
+      Mqtt__Username: kenlens
+      # Mqtt:Password comes from config/secrets/mqtt-password (Program.cs overlays it).
+      FloorPlans__AssetPath: /app/data/floor-plans
+      # Required, deliberately with no default: a planar solve holds the tag's height
+      # fixed, and a guessed one yields positions that are wrong and confident. The server
+      # refuses to start without it (docs/TDOA-COMMISSIONING.md).
+      Positioning__AssumedTagHeightMetres: ${KENLENS_TAG_HEIGHT_METRES:?set KENLENS_TAG_HEIGHT_METRES in .env - the height tags are carried at, in metres}
+    healthcheck:
+      # The image's own HEALTHCHECK probes :8080, which Production does not bind. -k skips
+      # only the name check for this loopback probe.
+      test: ["CMD-SHELL", "curl -fsSk https://localhost:8443/health/live || exit 1"]
+      interval: 10s
+      timeout: 3s
+      start_period: 20s
+      retries: 12
+    volumes:
+      # Sanitized floor-plan images; the database stores only their file names, so back
+      # this up with the database (or use the configuration-export archive, which embeds
+      # the bytes — Story 2a.2).
+      - ./data/floor-plans:/app/data/floor-plans
+      - ./logs:/app/logs
+      # FileBackedSecretsProvider reads each file as a config key; startup fails fast if a
+      # required one is missing or empty (docs/SECURITY.md).
+      - ./config/secrets:/app/config/secrets:ro
+
+volumes:
+  kenlens-postgres-data:
+  kenlens-mosquitto-data:
