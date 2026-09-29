@@ -35,7 +35,8 @@
 #                                  server-cert.pfx (web), db-ca.crt (copy of the CA)
 #   config/tls/                    postgres.{crt,key}, mqtt-broker.{crt,key}, web.crt
 #   config/mosquitto/passwd        user `kenlens`, hashed by the broker image itself
-#   .env                           KENLENS_VERSION, KENLENS_HOST, KENLENS_TAG_HEIGHT_METRES
+#   .env                           KENLENS_VERSION, KENLENS_HOST, KENLENS_TAG_HEIGHT_METRES,
+#                                  KENLENS_DB_TUNE_MEMORY
 #
 # Owners: postgres.key and db-password belong to uid 70 (the Postgres image's user),
 # mqtt-broker.key and passwd to uid 1883 (Mosquitto's). Without root the script sets them
@@ -213,6 +214,18 @@ if [[ ! -f .env ]]; then
 fi
 [[ -z "$tag_height" ]] || env_set KENLENS_TAG_HEIGHT_METRES "$tag_height"
 [[ -z "$new_hosts" ]]  || env_set KENLENS_HOST "$new_hosts"
+
+# The memory timescaledb-tune sizes PostgreSQL for on first start (issue #229). Left to
+# itself the image reads it from the memory cgroup, and on a host without that controller —
+# a Raspberry Pi, by default — it passes 0 MB and aborts the database's first start.
+if [[ -z "$(env_get KENLENS_DB_TUNE_MEMORY)" ]]; then
+  mem_kb=$(awk '/^MemTotal:/ { print $2 }' /proc/meminfo 2>/dev/null || true)
+  if [[ "$mem_kb" =~ ^[0-9]+$ ]]; then
+    env_set KENLENS_DB_TUNE_MEMORY "$((mem_kb / 1024))MB"
+  else
+    say "warning: could not read MemTotal from /proc/meminfo; KENLENS_DB_TUNE_MEMORY not set."
+  fi
+fi
 
 # ---------------------------------------------------------------------------
 # Ownership — collected here, applied once at the end.

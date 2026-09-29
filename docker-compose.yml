@@ -51,6 +51,9 @@ services:
       POSTGRES_DB: kenlens
       POSTGRES_USER: kenlens
       POSTGRES_PASSWORD_FILE: /run/secrets/db-password
+      # Sizes timescaledb-tune's first-start tuning; written by kenlens-setup.sh. Without it the
+      # image probes the memory cgroup, and where that is absent the first start fails (#229).
+      TS_TUNE_MEMORY: ${KENLENS_DB_TUNE_MEMORY:-}
     volumes:
       - kenlens-postgres-data:/var/lib/postgresql/data
       - ./postgres/pg_hba.conf:/kenlens/pg_hba.conf:ro
