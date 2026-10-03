@@ -6,9 +6,10 @@
 # secret the stack reads and `.env`. Run it once per host, from anywhere; it always works on the directory it lives in.
 #
 #   ./kenlens-setup.sh                                   # asks for what it needs
-#   ./kenlens-setup.sh --host kenlens.lan --host 192.168.1.20 --tag-height 1.2 \
+#   ./kenlens-setup.sh --host kenlens.lan --host 192.168.1.20 --https-port 443 \
 #                      --non-interactive                 # CI, or a scripted install
 #   ./kenlens-setup.sh --rotate broker                   # re-issue one item
+#   ./kenlens-setup.sh --update latest                   # upgrade to a release (or --update vX.Y.Z)
 #
 # Options:
 #   --host <name|ip>     A name or IPv4/IPv6 address browsers and anchors use to reach this
@@ -23,8 +24,14 @@
 #                        KenLens's MQTT page shows the exact command to change it.
 #   --no-domain          Constrain anchor console certificates to <host>.local only: no
 #                        site domain, detected or stored.
+#   --https-port <n>     The port browsers connect to; 8443 unless given, asked for on a fresh
+#                        install. Only the host side of the mapping: inside the container the
+#                        server always listens on 8443. Remembered in .env as KENLENS_HTTPS_PORT;
+#                        to change it later run --https-port again, then docker compose up -d.
 #   --tag-height <m>     The height tags are carried at, in metres (KENLENS_TAG_HEIGHT_METRES).
-#                        No default: a guess makes every position wrong without any error.
+#                        Optional: 1.2 m unless .env says otherwise. A height off by 20 cm moves
+#                        a position by centimetres at the room's centre and by a few tens of
+#                        centimetres directly under an anchor.
 #   --version <vX.Y.Z>   The release .env pins. Defaults to the one in .env.example.
 #   --rotate <item>      Replace one existing item; repeatable. Items: ca, anchor-ca, web,
 #                        broker, postgres, db-password, jwt-key. Rotating `ca`
@@ -34,6 +41,11 @@
 #                        started with. There is no mqtt-password: the server makes up its own
 #                        broker password and keeps it with its MQTT settings.
 #   --non-interactive    Never prompt; fail naming the missing flag instead.
+#   --update <tag>       Upgrade (or downgrade) this install to a release: downloads that
+#                        release's bundle from GitHub, checks it, unpacks it over this directory
+#                        (never touching .env, config/, data/ or logs/), pins KENLENS_VERSION,
+#                        runs the new script once, then docker compose pull and up -d --wait.
+#                        <tag> is vX.Y.Z or `latest`. Takes no other option.
 #   -h, --help           Show this help.
 #
 # Idempotent: a secret, key or certificate that already exists is never replaced unless its
@@ -54,14 +66,16 @@
 #   config/ntp/                    the site's own time servers for the anchors, if any
 #                                  (created empty; see chrony/chrony.conf)
 #   data/keys/                     the server's key ring (created empty, mode 0700)
-#   .env                           KENLENS_VERSION, KENLENS_HOST, KENLENS_ANCHOR_DOMAINS,
-#                                  KENLENS_TAG_HEIGHT_METRES, KENLENS_DB_TUNE_MEMORY
+#   .env                           KENLENS_VERSION, KENLENS_HTTPS_PORT, KENLENS_HOST,
+#                                  KENLENS_ANCHOR_DOMAINS, KENLENS_TAG_HEIGHT_METRES,
+#                                  KENLENS_DB_TUNE_MEMORY
 #
 # Owners: postgres.key and db-password belong to uid 70 (the Postgres image's user),
 # mqtt-broker.key to uid 1883 (Mosquitto's). Without root the script sets them through the
 # broker image, so it never needs sudo.
 #
-# Needs bash, openssl and docker. No network access beyond pulling the broker image once.
+# Needs bash, openssl and docker; --update also curl and tar. No network access beyond pulling
+# the broker image once, except --update, which downloads the bundle from GitHub.
 
 set -euo pipefail
 
@@ -94,7 +108,14 @@ hosts=()
 domains=()
 no_domain=false
 tag_height=""
+https_port=""
+readonly DEFAULT_HTTPS_PORT=8443
 version=""
+update_tag=""
+readonly DEPLOY_REPO="kenlens-rtls/kenlens-deploy"
+# Overridable so a test can stand GitHub in; the convention scripts/publish-deploy-bundle.sh set.
+readonly GITHUB_API_URL="${GITHUB_API_URL:-https://api.github.com}"
+readonly KENLENS_DOWNLOAD_URL="${KENLENS_DOWNLOAD_URL:-https://github.com/$DEPLOY_REPO/releases/download}"
 interactive=true
 declare -A rotate=()
 
@@ -108,8 +129,10 @@ while [[ $# -gt 0 ]]; do
     --host)            [[ $# -ge 2 ]] || die "--host needs a value"; hosts+=("$2"); shift 2 ;;
     --domain)          [[ $# -ge 2 ]] || die "--domain needs a value"; domains+=("$2"); shift 2 ;;
     --no-domain)       no_domain=true; shift ;;
+    --https-port)      [[ $# -ge 2 ]] || die "--https-port needs a value"; https_port="$2"; shift 2 ;;
     --tag-height)      [[ $# -ge 2 ]] || die "--tag-height needs a value"; tag_height="$2"; shift 2 ;;
     --version)         [[ $# -ge 2 ]] || die "--version needs a value"; version="$2"; shift 2 ;;
+    --update)          [[ $# -ge 2 && -n "$2" ]] || die "--update needs a release tag (vX.Y.Z) or 'latest'"; update_tag="$2"; shift 2 ;;
     --rotate)          [[ $# -ge 2 ]] || die "--rotate needs an item: $ROTATABLE"
                        [[ " $ROTATABLE " == *" $2 "* ]] || die "cannot rotate '$2'; items: $ROTATABLE"
                        rotate[$2]=1; shift 2 ;;
@@ -163,6 +186,109 @@ wants() { # wants <item> <file> — true when the file is missing or its item is
   [[ ! -e "$2" || -n "${rotate[$1]:-}" ]]
 }
 
+version_lt() { # version_lt <vA.B.C> <vX.Y.Z> — the first is older; both must be vX.Y.Z
+  local a b
+  IFS=. read -r -a a <<< "${1#v}"
+  IFS=. read -r -a b <<< "${2#v}"
+  (( 10#${a[0]} < 10#${b[0]} || (10#${a[0]} == 10#${b[0]} && (10#${a[1]} < 10#${b[1]} \
+     || (10#${a[1]} == 10#${b[1]} && 10#${a[2]} < 10#${b[2]}))) ))
+}
+
+url_host() { # url_host <name|ip> — the host part of a URL; an IPv6 literal goes in brackets
+  if [[ "$1" == *:* ]]; then printf '[%s]' "$1"; else printf '%s' "$1"; fi
+}
+
+# ---------------------------------------------------------------------------
+# --update — fetch a release's bundle, apply it here, start it.
+#
+# Called before anything below, and it exits the process itself: once the bundle is unpacked
+# over this directory THIS FILE has been replaced, and bash reads a script as it runs it, so
+# nothing after the call may ever execute from the old file. Everything is checked in a
+# temporary directory first; the install directory is touched only once the bundle is known
+# to be the right one.
+# ---------------------------------------------------------------------------
+
+update_stage=""
+update() { # update <tag|latest> — never returns
+  local tag=$1 current asset pinned f host old_port
+  [[ -f .env ]] || die "nothing is installed in $DIR (no .env); follow the install guide first"
+  command -v curl >/dev/null || die "curl is required for --update"
+  command -v tar  >/dev/null || die "tar is required for --update"
+  if [[ "$tag" == latest ]]; then
+    tag=$(curl -fsSL "$GITHUB_API_URL/repos/$DEPLOY_REPO/releases/latest" \
+          | sed -n 's/.*"tag_name": *"\([^"]*\)".*/\1/p') \
+      || die "could not get the latest release from $GITHUB_API_URL (no network, or GitHub's rate" \
+             "limit for unauthenticated requests); name the release instead: --update vX.Y.Z"
+    [[ -n "$tag" ]] || die "no latest release at $GITHUB_API_URL/repos/$DEPLOY_REPO"
+  fi
+  [[ "$tag" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]] || die "'$tag' is not a release tag (vX.Y.Z) or 'latest'"
+  current=$(env_get KENLENS_VERSION)
+  # Both the pin and the bundle on disk (its .env.example names its release): an install made
+  # with --version <other> has a pin that says one thing and files that say another.
+  if [[ "$tag" == "$current" && "$tag" == "$(sed -n 's/^KENLENS_VERSION=//p' .env.example 2>/dev/null)" ]]; then
+    say "already on $tag; nothing to do"
+    exit 0
+  fi
+
+  # The bundle's files are read by the containers (start.sh by the broker's user, the chrony
+  # config by chrony's), so they must not inherit this script's umask of 077. .env is never
+  # written by the copy below; env_set keeps it 0600.
+  umask 022
+  update_stage=$(mktemp -d "${TMPDIR:-/tmp}/kenlens-update.XXXXXX")
+  trap 'rm -rf "$update_stage"' EXIT
+  asset="kenlens-deploy-$tag.tar.gz"
+  say "downloading $asset"
+  curl -fsSL -o "$update_stage/$asset" "$KENLENS_DOWNLOAD_URL/$tag/$asset" \
+    || die "could not download $KENLENS_DOWNLOAD_URL/$tag/$asset; is $tag a published release? Nothing was changed."
+  mkdir "$update_stage/bundle"
+  tar -xzf "$update_stage/$asset" -C "$update_stage/bundle" --strip-components=1 \
+    || die "$asset did not unpack; nothing was changed"
+  for f in kenlens-setup.sh docker-compose.yml .env.example; do
+    [[ -f "$update_stage/bundle/$f" ]] || die "$asset holds no $f, so it is not a KenLens deploy bundle; nothing was changed"
+  done
+  pinned=$(sed -n 's/^KENLENS_VERSION=//p' "$update_stage/bundle/.env.example" | head -n 1)
+  [[ "$pinned" == "$tag" ]] || die "$asset is pinned to '$pinned', not $tag; nothing was changed"
+  for f in .env config data logs; do
+    [[ ! -e "$update_stage/bundle/$f" ]] || die "$asset carries $f, which a bundle never does; nothing was changed"
+  done
+
+  if [[ "$current" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]] && version_lt "$tag" "$current"; then
+    say "warning: $tag is older than $current. The database keeps the newer release's schema;" \
+        "it is not migrated back."
+  fi
+  # An install made before KENLENS_HTTPS_PORT existed could only choose its port by editing the
+  # mapping in docker-compose.yml, which the copy below replaces: keep that choice in .env.
+  if [[ -z "$(env_get KENLENS_HTTPS_PORT)" ]]; then
+    old_port=$(sed -n 's/^ *- "\([0-9]\{1,5\}\):8443"$/\1/p' docker-compose.yml 2>/dev/null)
+    [[ -z "$old_port" || "$old_port" == "$DEFAULT_HTTPS_PORT" ]] || env_set KENLENS_HTTPS_PORT "$old_port"
+  fi
+  # From here this file is gone: see the banner above.
+  cp -R "$update_stage/bundle/." "$DIR/" \
+    || die "copying the $tag bundle into $DIR failed part-way (see above): this directory now holds" \
+           "files from two releases and .env still pins $current. Fix the cause, then run --update $tag again."
+  env_set KENLENS_VERSION "$tag"
+  say "applied the $tag bundle; preparing the host with its setup script"
+  "$DIR/kenlens-setup.sh" --non-interactive </dev/null \
+    || die "the $tag setup script failed; the bundle is in place and .env pins $tag"
+  say "pulling the $tag images"
+  docker compose pull || die "docker compose pull failed; run it again, then docker compose up -d --wait"
+  # --remove-orphans: a release that drops or renames a service must not leave the old container
+  # running, holding its ports.
+  docker compose up -d --wait --remove-orphans || die "the stack did not become healthy; see docker compose logs"
+  host=$(env_get KENLENS_HOST)
+  host=${host%%,*}
+  [[ -n "$host" ]] && host=$(url_host "$host") || host="<host>"
+  say "KenLens $tag is at https://$host:$(env_get KENLENS_HTTPS_PORT)"
+  exit 0
+}
+
+if [[ -n "$update_tag" ]]; then
+  [[ ${#hosts[@]} -eq 0 && ${#domains[@]} -eq 0 && $no_domain == false && -z "$tag_height" \
+     && -z "$version" && -z "$https_port" && ${#rotate[@]} -eq 0 ]] \
+    || die "--update takes no other option"
+  update "$update_tag"
+fi
+
 # ---------------------------------------------------------------------------
 # Inputs — every answer is settled before anything is written, so a refused or
 # interrupted run leaves the directory as it found it.
@@ -174,20 +300,46 @@ if [[ ! -f .env ]]; then
   [[ "$version" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]] || die "version '$version' is not vX.Y.Z"
 elif [[ -n "$version" && "$version" != "$(env_get KENLENS_VERSION)" ]]; then
   say "warning: .env already pins $(env_get KENLENS_VERSION); --version $version ignored." \
-      "To upgrade, edit KENLENS_VERSION in .env, then docker compose pull && docker compose up -d."
+      "To upgrade, run ./kenlens-setup.sh --update $version."
   version=""
 fi
 
-if [[ -z "$(env_get KENLENS_TAG_HEIGHT_METRES)" ]]; then
-  [[ -n "$tag_height" ]] || tag_height=$(ask --tag-height \
-    "Height tags are carried at, in metres (measured, same frame as the anchor survey)")
-  if ! [[ "$tag_height" =~ ^[0-9]+(\.[0-9]+)?$ ]] || ! awk -v h="$tag_height" 'BEGIN { exit !(h > 0) }'; then
+valid_port() { [[ "$1" =~ ^[0-9]{1,5}$ ]] && (( 10#$1 >= 1 && 10#$1 <= 65535 )); }
+
+[[ -z "$https_port" ]] || valid_port "$https_port" || die "HTTPS port '$https_port' is not a port number (1-65535)"
+new_https_port=""
+port_changed=false
+if [[ ! -f .env ]]; then
+  if [[ -z "$https_port" ]] && $interactive; then
+    https_port=$(ask --https-port "HTTPS port browsers connect to [$DEFAULT_HTTPS_PORT]")
+    https_port=${https_port// /}
+    [[ -n "$https_port" ]] || https_port=$DEFAULT_HTTPS_PORT
+    valid_port "$https_port" || die "HTTPS port '$https_port' is not a port number (1-65535)"
+  fi
+  new_https_port=${https_port:-$DEFAULT_HTTPS_PORT}
+else
+  # An install made before the key existed ran on compose's default, so that is what it has.
+  stored_port=$(env_get KENLENS_HTTPS_PORT)
+  effective_port=${stored_port:-$DEFAULT_HTTPS_PORT}
+  if [[ -n "$https_port" && "$https_port" != "$effective_port" ]]; then
+    new_https_port=$https_port
+    port_changed=true
+  elif [[ -z "$stored_port" ]]; then
+    new_https_port=$effective_port
+  fi
+fi
+
+# Optional since issue #248: docker-compose.yml holds the tag at 1.2 m unless .env says otherwise.
+if [[ -n "$tag_height" ]]; then
+  stored_height=$(env_get KENLENS_TAG_HEIGHT_METRES)
+  if [[ -n "$stored_height" ]]; then
+    [[ "$tag_height" == "$stored_height" ]] \
+      || say "warning: .env already sets KENLENS_TAG_HEIGHT_METRES=$stored_height;" \
+             "--tag-height $tag_height ignored. Edit .env to change it."
+    tag_height=""
+  elif ! [[ "$tag_height" =~ ^[0-9]+(\.[0-9]+)?$ ]] || ! awk -v h="$tag_height" 'BEGIN { exit !(h > 0) }'; then
     die "tag height '$tag_height' is not a positive number of metres"
   fi
-elif [[ -n "$tag_height" && "$tag_height" != "$(env_get KENLENS_TAG_HEIGHT_METRES)" ]]; then
-  say "warning: .env already sets KENLENS_TAG_HEIGHT_METRES=$(env_get KENLENS_TAG_HEIGHT_METRES);" \
-      "--tag-height $tag_height ignored. Edit .env to change it."
-  tag_height=""
 fi
 
 ca_new=false
@@ -312,6 +464,7 @@ if [[ ! -f .env ]]; then
   new_env=true
 fi
 [[ -z "$tag_height" ]] || env_set KENLENS_TAG_HEIGHT_METRES "$tag_height"
+[[ -z "$new_https_port" ]] || env_set KENLENS_HTTPS_PORT "$new_https_port"
 [[ -z "$new_hosts" ]]  || env_set KENLENS_HOST "$new_hosts"
 ! $domains_set         || env_set KENLENS_ANCHOR_DOMAINS "$new_domains"
 
@@ -602,3 +755,14 @@ if $ca_new; then
   say "the KenLens CA is config/ca/kenlens-ca.crt — install it in browsers and give it to anchors." \
       "Back up config/ca/kenlens-ca.key: losing it means re-trusting a new CA everywhere."
 fi
+
+if $port_changed; then
+  echo
+  say "the HTTPS port is now $new_https_port; docker compose up -d applies it."
+fi
+
+first_host=$(env_get KENLENS_HOST)
+first_host=${first_host%%,*}
+[[ -n "$first_host" ]] && first_host=$(url_host "$first_host") || first_host="<host>"
+echo
+say "KenLens is at https://$first_host:$(env_get KENLENS_HTTPS_PORT)"

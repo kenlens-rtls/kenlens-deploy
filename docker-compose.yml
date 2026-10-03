@@ -161,8 +161,10 @@ services:
         condition: service_healthy
       mqtt-broker:
         condition: service_healthy
+    # The host side is KENLENS_HTTPS_PORT (kenlens-setup.sh asks for it; 8443 unless given); the
+    # container always listens on 8443, which Tls__HttpsPort and the healthcheck below name.
     ports:
-      - "8443:8443"
+      - "${KENLENS_HTTPS_PORT:-8443}:8443"
     environment:
       ASPNETCORE_ENVIRONMENT: Production
       # Clear the image's ASPNETCORE_URLS so it cannot override the Kestrel binding in
@@ -186,9 +188,6 @@ services:
       DataProtection__CertificatePath: /app/config/dataprotection/key-ring.crt
       DataProtection__CertificateKeyPath: /app/config/dataprotection/key-ring.key
       FloorPlans__AssetPath: /app/data/floor-plans
-      # Required, deliberately with no default: a planar solve holds the tag's height
-      # fixed, and a guessed one yields positions that are wrong and confident. The server
-      # refuses to start without it.
       # Health check only (issue #232): whether the anchors' time server answers, and from what.
       Ntp__Host: ntp
       # Issue #234: the server issues and renews every anchor's console certificate over MQTT,
@@ -196,7 +195,13 @@ services:
       AnchorConsole__CaCertificatePath: /app/config/anchor-ca/anchor-console-ca.crt
       AnchorConsole__CaKeyPath: /app/config/anchor-ca/anchor-console-ca.key
       AnchorConsole__RootCertificatePath: /app/config/secrets/db-ca.crt
-      Positioning__AssumedTagHeightMetres: ${KENLENS_TAG_HEIGHT_METRES:?set KENLENS_TAG_HEIGHT_METRES in .env - the height tags are carried at, in metres}
+      # Issue #242: the KenLens CA, offered to browsers to trust (https://<host>:8443/trust).
+      KenLensCa__CertificatePath: /app/config/secrets/db-ca.crt
+      # The height tags are carried at, in metres, which the planar solve holds fixed. 1.2 m
+      # unless .env says otherwise (KENLENS_TAG_HEIGHT_METRES, or kenlens-setup.sh --tag-height).
+      # A height off by 20 cm moves a position by centimetres at the room's centre and by a few
+      # tens of centimetres directly under an anchor (issue #248).
+      Positioning__AssumedTagHeightMetres: ${KENLENS_TAG_HEIGHT_METRES:-1.2}
     healthcheck:
       # The image's own HEALTHCHECK probes :8080, which Production does not bind. -k skips
       # only the name check for this loopback probe.
