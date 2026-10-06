@@ -16,6 +16,9 @@ this repository with the bundle attached as `kenlens-deploy-vX.Y.Z.tar.gz`.
 - [Install](#install)
 - [Uninstall](#uninstall)
 
+Running KenLens once it is installed — upgrading, backing up, rolling back, renewing certificates,
+troubleshooting — is in the [operator guide](https://github.com/kenlens-rtls/kenlens-deploy/wiki).
+
 ## Requirements
 
 **Host.** Any 64-bit Linux host that runs Docker, `amd64` or `arm64`. On a Raspberry Pi:
@@ -125,6 +128,9 @@ a setting it introduced), and nothing under `config/` or `data/` is touched:
 ./kenlens-setup.sh --update latest       # or --update vX.Y.Z, from the Releases page
 ```
 
+[Back up](https://github.com/kenlens-rtls/kenlens-deploy/wiki/Back-up-and-restore) before upgrading: a release that changes the database cannot be
+rolled back without the backup.
+
 ## Uninstall
 
 ```bash
@@ -134,4 +140,5 @@ docker compose down -v       # ...and deletes the database — every user, zone 
 sudo rm -rf /opt/kenlens     # certificates, secrets, settings, floor plans, logs
 ```
 
-`down -v` and deleting the directory cannot be undone.
+`down -v` and deleting the directory cannot be undone. [Back up](https://github.com/kenlens-rtls/kenlens-deploy/wiki/Back-up-and-restore) first if
+there is anything to keep.
