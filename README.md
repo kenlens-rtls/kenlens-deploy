@@ -128,8 +128,9 @@ a setting it introduced), and nothing under `config/` or `data/` is touched:
 ./kenlens-setup.sh --update latest       # or --update vX.Y.Z, from the Releases page
 ```
 
-[Back up](https://github.com/kenlens-rtls/kenlens-deploy/wiki/Back-up-and-restore) before upgrading: a release that changes the database cannot be
-rolled back without the backup.
+It backs the installation up first, into `backups/`, stopping the stack while it does. Copy the
+backup off this host: it holds every secret of the installation. See
+[Back up and restore](https://github.com/kenlens-rtls/kenlens-deploy/wiki/Back-up-and-restore).
 
 ## Uninstall
 

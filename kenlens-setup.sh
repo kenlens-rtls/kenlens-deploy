@@ -45,7 +45,15 @@
 #                        release's bundle from GitHub, checks it, unpacks it over this directory
 #                        (never touching .env, config/, data/ or logs/), pins KENLENS_VERSION,
 #                        runs the new script once, then docker compose pull and up -d --wait.
-#                        <tag> is vX.Y.Z or `latest`. Takes no other option.
+#                        <tag> is vX.Y.Z or `latest`. Takes no option but the two below.
+#                        Backs the install up first: see --backup-dir.
+#   --backup-dir <path>  With --update: where the backup is written; backups/ in this directory
+#                        unless given. Two archives, taken with the stack stopped and started
+#                        again straight after — the directory (all but backups/ and logs/) and
+#                        the database volume — in the format the wiki's restore steps read. The
+#                        newest two backups there are kept and older ones deleted. They hold
+#                        every secret of the install: copy them off this host.
+#   --no-backup          With --update: take no backup.
 #   -h, --help           Show this help.
 #
 # Idempotent: a secret, key or certificate that already exists is never replaced unless its
@@ -112,6 +120,8 @@ https_port=""
 readonly DEFAULT_HTTPS_PORT=8443
 version=""
 update_tag=""
+backup=true
+backup_dir=""
 readonly DEPLOY_REPO="kenlens-rtls/kenlens-deploy"
 # Overridable so a test can stand GitHub in; the convention scripts/publish-deploy-bundle.sh set.
 readonly GITHUB_API_URL="${GITHUB_API_URL:-https://api.github.com}"
@@ -133,6 +143,8 @@ while [[ $# -gt 0 ]]; do
     --tag-height)      [[ $# -ge 2 ]] || die "--tag-height needs a value"; tag_height="$2"; shift 2 ;;
     --version)         [[ $# -ge 2 ]] || die "--version needs a value"; version="$2"; shift 2 ;;
     --update)          [[ $# -ge 2 && -n "$2" ]] || die "--update needs a release tag (vX.Y.Z) or 'latest'"; update_tag="$2"; shift 2 ;;
+    --backup-dir)      [[ $# -ge 2 && -n "$2" ]] || die "--backup-dir needs a path"; backup_dir=$(realpath -m -- "$2"); shift 2 ;;
+    --no-backup)       backup=false; shift ;;
     --rotate)          [[ $# -ge 2 ]] || die "--rotate needs an item: $ROTATABLE"
                        [[ " $ROTATABLE " == *" $2 "* ]] || die "cannot rotate '$2'; items: $ROTATABLE"
                        rotate[$2]=1; shift 2 ;;
@@ -208,6 +220,75 @@ url_host() { # url_host <name|ip> — the host part of a URL; an IPv6 literal go
 # to be the right one.
 # ---------------------------------------------------------------------------
 
+# The backup --update takes before it changes anything: the whole-installation backup of the
+# wiki's *Back up and restore* page, so its restore steps read it unchanged. Both archives are
+# written from a container: files under config/ belong to the containers' users, and the
+# database is reached through the compose service, so its volume's name is never guessed.
+readonly PGDATA_DIR=/var/lib/postgresql/data
+readonly BACKUPS_KEPT=2
+restart_after_backup() { # restart_after_backup <service...> — a failure is reported, not fatal
+  (( $# == 0 )) || docker compose start "$@" \
+    || say "warning: could not start $* again after the backup; the upgrade starts the stack anyway"
+}
+update_backup() { # update_backup <current-version> — changes nothing on failure
+  local from=${1:-unknown} stamp name files db db_kib dir_kib need free probe exclude=() running=() f
+  [[ -n "$backup_dir" ]] || backup_dir="$DIR/backups"
+  [[ "$from" =~ ^[A-Za-z0-9._-]+$ ]] || from=unknown
+  # An archive of the directory must not contain the backups, wherever they are kept inside it.
+  exclude=(--exclude=./backups --exclude=./logs)
+  [[ "$backup_dir/" != "$DIR/"* ]] || exclude+=("--exclude=./${backup_dir#"$DIR/"}")
+
+  # Room for both archives, counted uncompressed, before anything is stopped.
+  db_kib=$(docker compose run -T --rm --no-deps --entrypoint du postgres -sk "$PGDATA_DIR" | awk '{ print $1; exit }') \
+    && dir_kib=$(docker run --rm --user 0 --entrypoint /bin/sh -v "$DIR:/b:ro" "$MOSQUITTO_IMAGE" \
+                   -c 'cd /b && du -sk . | cut -f1') \
+    && [[ "$db_kib" =~ ^[0-9]+$ && "$dir_kib" =~ ^[0-9]+$ ]] \
+    || die "could not measure the database and this directory for the backup; nothing was changed." \
+           "To upgrade without one: --no-backup"
+  need=$(( db_kib + dir_kib ))
+  probe=$backup_dir
+  until [[ -d "$probe" ]]; do probe=$(dirname "$probe"); done
+  free=$(df -Pk "$probe" | awk 'NR == 2 { print $4 }')
+  (( free > need )) \
+    || die "the backup needs up to $(( need / 1024 )) MiB and $probe has $(( free / 1024 )) MiB free;" \
+           "nothing was changed. Free some space, write it elsewhere with --backup-dir <path>," \
+           "or upgrade without one: --no-backup"
+
+  mkdir -p "$backup_dir" && chmod 0700 "$backup_dir" || die "cannot create $backup_dir; nothing was changed"
+  stamp=$(date -u +%Y%m%dT%H%M%SZ)
+  name="kenlens-$stamp-$from"
+  files="$backup_dir/$name-files.tar.gz"
+  db="$backup_dir/$name-db.tar.gz"
+  [[ ! -e "$files" && ! -e "$db" ]] || die "$files already exists; nothing was changed. Run --update again."
+
+  # Only what was running is started again: `start` on the whole project refuses a service whose
+  # dependency has no container. The upgrade's `up -d` starts everything in any case.
+  mapfile -t running < <(docker compose ps --services --status running)
+  say "backing up $from to $backup_dir (stopping the stack)"
+  docker compose stop || { restart_after_backup "${running[@]}"
+                           die "could not stop the stack for the backup; nothing was changed"; }
+  # Both archives are 0600 — they hold every secret of the install.
+  if ! ( umask 077
+         docker run --rm --user 0 --entrypoint /bin/sh -v "$DIR:/b:ro" "$MOSQUITTO_IMAGE" \
+           -c 'cd /b && tar -czf - "$@" .' sh "${exclude[@]}" > "$files" \
+         && docker compose run -T --rm --no-deps --entrypoint tar postgres -czf - -C "$PGDATA_DIR" . > "$db" ); then
+    rm -f "$files" "$db"
+    restart_after_backup "${running[@]}"
+    die "the backup failed (see above); nothing was changed. To upgrade without one: --no-backup"
+  fi
+  restart_after_backup "${running[@]}"
+  say "backup: $files"
+  say "        $db"
+  say "        copy both off this host; restore them as the wiki's Back up and restore page shows"
+
+  # Keep the newest backups; a backup is a pair, named by its time, so the names sort by age.
+  for f in $(ls -1 "$backup_dir" | { grep -E '^kenlens-[0-9]{8}T[0-9]{6}Z-.*-files\.tar\.gz$' || true; } \
+               | sort -r | tail -n +$(( BACKUPS_KEPT + 1 ))); do
+    rm -f "$backup_dir/$f" "$backup_dir/${f%-files.tar.gz}-db.tar.gz"
+    say "removed the older backup ${f%-files.tar.gz}"
+  done
+}
+
 update_stage=""
 update() { # update <tag|latest> — never returns
   local tag=$1 current asset pinned f host old_port
@@ -248,7 +329,7 @@ update() { # update <tag|latest> — never returns
   done
   pinned=$(sed -n 's/^KENLENS_VERSION=//p' "$update_stage/bundle/.env.example" | head -n 1)
   [[ "$pinned" == "$tag" ]] || die "$asset is pinned to '$pinned', not $tag; nothing was changed"
-  for f in .env config data logs; do
+  for f in .env config data logs backups; do
     [[ ! -e "$update_stage/bundle/$f" ]] || die "$asset carries $f, which a bundle never does; nothing was changed"
   done
 
@@ -256,6 +337,7 @@ update() { # update <tag|latest> — never returns
     say "warning: $tag is older than $current. The database keeps the newer release's schema;" \
         "it is not migrated back."
   fi
+  if $backup; then update_backup "$current"; else say "--no-backup: taking no backup"; fi
   # An install made before KENLENS_HTTPS_PORT existed could only choose its port by editing the
   # mapping in docker-compose.yml, which the copy below replaces: keep that choice in .env.
   if [[ -z "$(env_get KENLENS_HTTPS_PORT)" ]]; then
@@ -285,9 +367,11 @@ update() { # update <tag|latest> — never returns
 if [[ -n "$update_tag" ]]; then
   [[ ${#hosts[@]} -eq 0 && ${#domains[@]} -eq 0 && $no_domain == false && -z "$tag_height" \
      && -z "$version" && -z "$https_port" && ${#rotate[@]} -eq 0 ]] \
-    || die "--update takes no other option"
+    || die "--update takes no other option but --backup-dir and --no-backup"
+  if ! $backup && [[ -n "$backup_dir" ]]; then die "--backup-dir and --no-backup contradict each other"; fi
   update "$update_tag"
 fi
+[[ $backup == true && -z "$backup_dir" ]] || die "--backup-dir and --no-backup only go with --update"
 
 # ---------------------------------------------------------------------------
 # Inputs — every answer is settled before anything is written, so a refused or

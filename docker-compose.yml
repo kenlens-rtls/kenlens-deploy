@@ -188,6 +188,7 @@ services:
       DataProtection__CertificatePath: /app/config/dataprotection/key-ring.crt
       DataProtection__CertificateKeyPath: /app/config/dataprotection/key-ring.key
       FloorPlans__AssetPath: /app/data/floor-plans
+      Firmware__AssetPath: /app/data/firmware
       # Health check only (issue #232): whether the anchors' time server answers, and from what.
       Ntp__Host: ntp
       # Issue #234: the server issues and renews every anchor's console certificate over MQTT,
@@ -215,6 +216,9 @@ services:
       # this up with the database (or use the configuration-export archive, which embeds
       # the bytes).
       - ./data/floor-plans:/app/data/floor-plans
+      # Uploaded firmware images (Story 12.2), named by their SHA-256. Not in the
+      # configuration-export archive: re-upload them from the release if this is lost.
+      - ./data/firmware:/app/data/firmware
       # The Data Protection key ring; see the header.
       - ./data/keys:/app/data/keys
       - kenlens-broker-control:/app/data/broker-control
