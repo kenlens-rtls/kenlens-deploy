@@ -1,0 +1,63 @@
+# KenLens anchor bridge — turns the UWB boards on this host into anchors (Story 14.13).
+#
+# Self-contained: run it on its own, from the directory it lives in, on the host the boards are
+# plugged into. That is usually not the KenLens host: each anchor connects to KenLens's broker
+# over the network, as a real anchor does, so nothing here starts or reaches a KenLens stack.
+#
+#   ./anchor-bridge-setup.sh        # once: writes .env, offers a Raspberry Pi's serial settings
+#   docker compose up -d
+#
+# Development uses the repository-root docker-compose.anchor-bridge.yml instead, which builds
+# the image from source; the two share nothing.
+#
+# Anchors are created in the manager UI, https://<host>:8440. On every start until a manager
+# password is chosen, the container log prints a one-time setup token for choosing it:
+#   docker compose logs anchor-bridge | grep "setup token"
+# Each anchor then has its own console, https://<host>:8441 and up, where it is onboarded into
+# KenLens as a real anchor is.
+
+services:
+  anchor-bridge:
+    image: ${KENLENS_IMAGE_REPO:-ghcr.io/kenlens-rtls}/kenlens-anchor-bridge:${KENLENS_VERSION:?set KENLENS_VERSION in .env, e.g. v0.1.30}
+    restart: unless-stopped
+
+    # The host's network, not a bridge network: every anchor announces this host's address as
+    # config.ip, and KenLens dials that address on the anchor's console port. Inside a bridge network
+    # the container would announce its own internal address (172.x), which nothing else can reach.
+    # The manager listens on ANCHOR_BRIDGE_MANAGER_PORT and the consoles on 8441-8456, directly on
+    # the host — each anchor announces its own as config.console_port.
+    network_mode: host
+    environment:
+      AnchorBridge__Manager__Port: "${ANCHOR_BRIDGE_MANAGER_PORT:-8440}"
+
+    # Hot-plug: the host's /dev, bind-mounted, instead of a `devices:` list, which Docker resolves
+    # once at create time — a board plugged in later would be invisible until a recreate. Seeing a
+    # node is not being allowed to open it: the device cgroup refuses every node not granted
+    # below, so these rules are the actual permission. Serial classes only:
+    #   166 ttyACM*  (USB CDC-ACM — J-Link OB, DWM3001CDK, nRF dongles and their bootloader)
+    #   188 ttyUSB*  (USB-serial bridges — FTDI, CP210x, CH340)
+    #   204 ttyAMA*  (PL011 on-board UART — /dev/serial0 on a Pi with the UART on the PL011)
+    #   4:64 ttyS0   (mini-UART — /dev/serial0 on a Pi 3/4 that keeps its Bluetooth)
+    # ttyS0 is granted by minor alone: major 4 also holds the host's virtual consoles.
+    #
+    # Bluetooth: the host's BlueZ, over the system D-Bus socket — never raw HCI, so no capability.
+    # Without the socket every anchor runs without sightings.
+    volumes:
+      - /dev:/dev
+      - anchor-bridge-data:/data
+      - /run/dbus/system_bus_socket:/run/dbus/system_bus_socket
+    device_cgroup_rules:
+      - "c 166:* rmw"
+      - "c 188:* rmw"
+      - "c 204:* rmw"
+      - "c 4:64 rmw"
+
+    # Numeric, never a group name: a name is resolved in the container, where it may not match
+    # the host group owning the device nodes. anchor-bridge-setup.sh writes it.
+    group_add:
+      - "${SERIAL_BRIDGE_GID:?set SERIAL_BRIDGE_GID in .env (anchor-bridge-setup.sh does)}"
+
+volumes:
+  # Every anchor's board_id, keys and passwords. `docker compose down -v` deletes it, and with it
+  # every anchor's identity in KenLens.
+  anchor-bridge-data:

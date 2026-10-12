@@ -19,9 +19,15 @@ this repository with the bundle attached as `kenlens-deploy-vX.Y.Z.tar.gz`.
 Running KenLens once it is installed — upgrading, backing up, rolling back, renewing certificates,
 troubleshooting — is in the [operator guide](https://github.com/kenlens-rtls/kenlens-deploy/wiki).
 
+UWB boards on a Raspberry Pi or another host become anchors with the
+[anchor bridge](anchor-bridge/), which has its own install guide. The firmware for those boards,
+and for tags, comes with each release: [UWB boards](uwb-boards/) flashes and configures them.
+
 ## Requirements
 
-**Host.** Any 64-bit Linux host that runs Docker, `amd64` or `arm64`. On a Raspberry Pi:
+**Host.** Any 64-bit Linux host that runs Docker, `amd64` or `arm64`. On a Raspberry Pi, the
+[Raspberry Pi guide](raspberry-pi/) and its script do all of this install, from Raspberry Pi Imager
+to the first sign-in. A Pi needs:
 
 - a **Pi 4 or Pi 5 with at least 4 GB** of RAM — 8 GB is comfortable. The stack itself needs
   about 500 MB;

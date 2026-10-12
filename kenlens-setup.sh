@@ -10,6 +10,7 @@
 #                      --non-interactive                 # CI, or a scripted install
 #   ./kenlens-setup.sh --rotate broker                   # re-issue one item
 #   ./kenlens-setup.sh --update latest                   # upgrade to a release (or --update vX.Y.Z)
+#   ./kenlens-setup.sh --version                         # the release installed here
 #
 # Options:
 #   --host <name|ip>     A name or IPv4/IPv6 address browsers and anchors use to reach this
@@ -32,7 +33,10 @@
 #                        Optional: 1.2 m unless .env says otherwise. A height off by 20 cm moves
 #                        a position by centimetres at the room's centre and by a few tens of
 #                        centimetres directly under an anchor.
-#   --version <vX.Y.Z>   The release .env pins. Defaults to the one in .env.example.
+#   --version            Alone, with no value: print the release installed here (the
+#                        KENLENS_VERSION .env pins) and exit; nothing else on the line runs.
+#   --version <vX.Y.Z>   On a fresh install, the release .env pins. Defaults to the one in
+#                        .env.example.
 #   --rotate <item>      Replace one existing item; repeatable. Items: ca, anchor-ca, web,
 #                        broker, postgres, db-password, jwt-key. Rotating `ca`
 #                        re-issues every certificate with it. Rotating `anchor-ca` re-issues
@@ -134,6 +138,16 @@ say() { echo "kenlens-setup: $*"; }
 
 usage() { sed -n '2,/^$/p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'; }
 
+show_version() { # the KENLENS_VERSION .env pins, alone on stdout — what --update writes
+  local installed bundled
+  bundled=$(sed -n 's/^KENLENS_VERSION=//p' "$DIR/.env.example" 2>/dev/null | head -n 1)
+  [[ -f "$DIR/.env" ]] \
+    || die "not set up here: no .env in $DIR (this bundle is ${bundled:-of an unknown release})"
+  installed=$(sed -n 's/^KENLENS_VERSION=//p' "$DIR/.env" | tail -n 1)
+  [[ -n "$installed" ]] || die "$DIR/.env pins no KENLENS_VERSION"
+  printf '%s\n' "$installed"
+}
+
 while [[ $# -gt 0 ]]; do
   case "$1" in
     --host)            [[ $# -ge 2 ]] || die "--host needs a value"; hosts+=("$2"); shift 2 ;;
@@ -141,7 +155,8 @@ while [[ $# -gt 0 ]]; do
     --no-domain)       no_domain=true; shift ;;
     --https-port)      [[ $# -ge 2 ]] || die "--https-port needs a value"; https_port="$2"; shift 2 ;;
     --tag-height)      [[ $# -ge 2 ]] || die "--tag-height needs a value"; tag_height="$2"; shift 2 ;;
-    --version)         [[ $# -ge 2 ]] || die "--version needs a value"; version="$2"; shift 2 ;;
+    --version)         if [[ $# -lt 2 || "$2" == -* ]]; then show_version; exit 0; fi
+                       version="$2"; shift 2 ;;
     --update)          [[ $# -ge 2 && -n "$2" ]] || die "--update needs a release tag (vX.Y.Z) or 'latest'"; update_tag="$2"; shift 2 ;;
     --backup-dir)      [[ $# -ge 2 && -n "$2" ]] || die "--backup-dir needs a path"; backup_dir=$(realpath -m -- "$2"); shift 2 ;;
     --no-backup)       backup=false; shift ;;

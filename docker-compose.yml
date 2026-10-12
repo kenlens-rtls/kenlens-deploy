@@ -6,8 +6,8 @@
 #
 # Four services — kenlens-server, PostgreSQL/TimescaleDB, Mosquitto and chrony (NTP for the
 # anchors). No Seq (the server
-# logs to ./logs in Production), no config-executor (a device simulator) and no serial
-# bridge. Development uses the repository-root docker-compose.yml instead; the two share
+# logs to ./logs in Production) and no anchor bridge, whose simulated anchors are the device
+# simulator. Development uses the repository-root docker-compose.yml instead; the two share
 # nothing.
 #
 # Every relative path below is relative to this file. Nothing under config/ is shipped:
@@ -189,6 +189,10 @@ services:
       DataProtection__CertificateKeyPath: /app/config/dataprotection/key-ring.key
       FloorPlans__AssetPath: /app/data/floor-plans
       Firmware__AssetPath: /app/data/firmware
+      # Issue #329: UWB configuration writes are on, so a freshly flashed board is given its role
+      # from KenLens (Configuration → UWB network), and MN slot repairs run. Board BLE writes are
+      # unauthenticated on current firmware: who may write is the config:write permission.
+      UwbConfig__AllowWrites: "true"
       # Health check only (issue #232): whether the anchors' time server answers, and from what.
       Ntp__Host: ntp
       # Issue #234: the server issues and renews every anchor's console certificate over MQTT,
