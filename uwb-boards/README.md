@@ -44,8 +44,7 @@ you run and download, for your board, the files whose names end in:
 
 | File | What it is |
 |---|---|
-| `-<board>-mcuboot.hex` | The bootloader. Written once, at the first flash |
-| `-<board>-app-signed.hex` | The firmware, signed for that bootloader |
+| `-<board>-full.hex` | The bootloader and the signed firmware, in one file. Written once, at the first flash |
 | `-<board>-ota.bin` | The same firmware for updates over Bluetooth. KenLens already has it: see [Updating a board later](#updating-a-board-later) |
 | `SHA256SUMS` | The checksum of every file |
 
@@ -61,14 +60,14 @@ checksum to compare with the file's line in `SHA256SUMS`.
 
 ## 2. Flash the board
 
-Both files go on the board: **the bootloader and the signed firmware**. The firmware alone does not
-start. Connect the board's J-Link connector to the computer.
+One file goes on the board: the `-full.hex`, which holds **the bootloader and the signed firmware**
+together. Connect the board's J-Link connector to the computer.
 
 ### With the Programmer app
 
 1. Open **nRF Connect for Desktop**, then **Programmer**.
 2. **Select device**: the board appears as a J-Link with its serial number.
-3. **Add file** twice: the `-mcuboot.hex`, then the `-app-signed.hex`. The memory map shows both.
+3. **Add file**: the `-full.hex`. The memory map shows the bootloader and the firmware.
 4. **Erase & write**. When it finishes, the board restarts with the new firmware.
 
 ### With nrfutil
@@ -76,9 +75,7 @@ start. Connect the board's J-Link connector to the computer.
 ```bash
 nrfutil device list                       # the board's serial number, if several are connected
 nrfutil device recover                    # erases the whole chip, and unlocks a locked one
-nrfutil device program --firmware uwbfirmware-<version>-<board>-mcuboot.hex \
-  --options chip_erase_mode=ERASE_RANGES_TOUCHED_BY_FIRMWARE
-nrfutil device program --firmware uwbfirmware-<version>-<board>-app-signed.hex \
+nrfutil device program --firmware uwbfirmware-<version>-<board>-full.hex \
   --options chip_erase_mode=ERASE_RANGES_TOUCHED_BY_FIRMWARE
 nrfutil device reset
 ```
@@ -91,6 +88,24 @@ the board is locked and `recover` is the only way in.
 
 A freshly flashed board has no configuration. It starts in its diagnostic mode, waiting to be told
 what it is, and announces itself over Bluetooth so that an anchor can hear it.
+
+### Known issue: newer DWM3001CDK chips lock their debug port
+
+Newer revisions of the DWM3001CDK's Nordic chip (nRF52833, build code Bxx or later) protect their
+debug port by default, and this firmware does not open it. Such a board may arrive locked and refuse
+programming the first time: `nrfutil device recover`, or **Erase all** in the Programmer, opens it.
+Once flashed, it programs and starts normally but is expected to **lock again at its next power-on or
+reset**.
+
+- **What still works:** everything the board does in service. Its configuration and its updates go
+  over Bluetooth, so giving it its role and rolling out new firmware from KenLens are unaffected.
+- **What is lost:** flashing it over USB again, and its debug console.
+- **To flash it over USB again:** run `nrfutil device recover`, or **Erase all** in the Programmer,
+  then flash it as above. That erases the whole chip, configuration included, so give the board its
+  role again afterwards.
+
+The boards tested so far carry older chips that never lock. Source: uwbfirmware `docs/kb/ota.md` at
+v0.28.0 (`9d6c47c7`).
 
 ## 3. Give the board its role
 
@@ -133,8 +148,8 @@ Bluetooth. Nothing is updated until you start one.
 | Symptom | Fix |
 |---|---|
 | The Programmer or `nrfutil` finds no device | Install the SEGGER J-Link Software, and use the board's J-Link USB connector — not its other USB port, if it has one |
-| Writing is refused, or the board reports it is protected | The chip is locked. `nrfutil device recover` erases and unlocks it, or **Erase all** in the Programmer, then flash again |
-| The board does not start after flashing | Only the firmware was written. Write the `-mcuboot.hex` as well |
+| Writing is refused, or the board reports it is protected | The chip is locked. `nrfutil device recover` erases and unlocks it, or **Erase all** in the Programmer, then flash again. A newer DWM3001CDK locks again at each power-on: see [the known issue](#known-issue-newer-dwm3001cdk-chips-lock-their-debug-port) |
+| The board does not start after flashing | Another file than the `-full.hex` was written. Flash the `-full.hex` |
 | The board never appears in **UWB network** | No anchor with Bluetooth hears it. Move it closer to one, and check the anchor's Bluetooth: a bridged anchor created without an adapter hears nothing |
 | A write is refused because the board is for another board type | The firmware for the other board was written. Flash the files for yours |
 | A rollout's item fails at the board | The image was signed with a different key than the board's bootloader. Flash the board over USB with this release's files |
