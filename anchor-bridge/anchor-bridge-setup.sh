@@ -83,6 +83,14 @@ interactive=true
 die() { echo "anchor-bridge-setup: $*" >&2; exit 1; }
 say() { echo "anchor-bridge-setup: $*"; }
 
+pi_model() { # the board's model string, or nothing when this is not a Raspberry Pi
+  [[ -r "$PI_MODEL_FILE" ]] || return 0
+  local model
+  model=$(tr -d '\0' < "$PI_MODEL_FILE")
+  [[ "$model" == "Raspberry Pi"* ]] && printf '%s' "$model"
+  return 0
+}
+
 usage() { sed -n '2,/^$/p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'; }
 
 show_version() { # the KENLENS_VERSION .env pins, alone on stdout — what --update writes
@@ -116,8 +124,16 @@ while [[ $# -gt 0 ]]; do
 done
 [[ -z "$pi_serial" || $no_pi_serial == false ]] || die "--pi-serial and --no-pi-serial contradict each other"
 
-command -v docker >/dev/null || die "docker is required: install Docker Engine (see the README)"
-docker compose version >/dev/null 2>&1 || die "the docker compose plugin is required (see the README)"
+# On a Pi, the KenLens Pi script installs Docker (issue #331); elsewhere, Docker's own instructions.
+docker_how() {
+  if [[ -n "$(pi_model)" ]]; then
+    printf '%s' "on a Raspberry Pi, install it with: curl -fsSLO https://raw.githubusercontent.com/$DEPLOY_REPO/main/raspberry-pi/kenlens-pi-setup.sh && bash kenlens-pi-setup.sh --prepare-only, then sign in again"
+  else
+    printf '%s' "install Docker Engine (see the README)"
+  fi
+}
+command -v docker >/dev/null || die "docker is required: $(docker_how)"
+docker compose version >/dev/null 2>&1 || die "the docker compose plugin is required: $(docker_how)"
 
 cd "$DIR"
 umask 077
@@ -275,14 +291,6 @@ fi
 
 reboot_needed=false
 
-pi_model() { # the board's model string, or nothing when this is not a Raspberry Pi
-  [[ -r "$PI_MODEL_FILE" ]] || return 0
-  local model
-  model=$(tr -d '\0' < "$PI_MODEL_FILE")
-  [[ "$model" == "Raspberry Pi"* ]] && printf '%s' "$model"
-  return 0
-}
-
 boot_dir() { # where config.txt and cmdline.txt are
   if [[ -n "${ANCHOR_BRIDGE_BOOT_DIR:-}" ]]; then printf '%s' "$ANCHOR_BRIDGE_BOOT_DIR"
   elif [[ -f /boot/firmware/config.txt ]]; then printf '/boot/firmware'
@@ -345,10 +353,18 @@ prepare_pi() {
     || { say "warning: no config.txt and cmdline.txt in $boot; set the serial port up by hand (see the README)"; return 0; }
   [[ "$model" =~ ^Raspberry\ Pi\ [34]\  ]] && has_bt_choice=true
 
+  # Set up already — by an earlier run, or by hand to the same effect — is not asked again: a rerun
+  # changes the mode only with --pi-serial (issue #332).
+  local set_up=false
+  if grep -qxF "$MARK_BEGIN" "$config" && grep -qE '^[[:space:]]*enable_uart=1[[:space:]]*$' "$config" \
+     && [[ "$(wanted_cmdline "$cmdline")" == "$(cat "$cmdline")" ]]; then
+    set_up=true
+  fi
+
   mode=$pi_serial
   if [[ -z "$mode" ]]; then
     mode=$(current_mode "$config")
-    if $has_bt_choice && $interactive; then
+    if $has_bt_choice && $interactive && ! $set_up; then
       echo
       echo "The Pi has one full UART, which it gives to its onboard Bluetooth. For the header:"
       echo "  1) default      Bluetooth keeps it; the header gets the mini-UART. Recommended."
@@ -396,6 +412,9 @@ prepare_pi() {
     fi
   else
     say "the header's serial port is already set up (Bluetooth mode $mode)"
+    if $has_bt_choice && [[ -z "$pi_serial" ]]; then
+      say "... to change the mode: ./anchor-bridge-setup.sh --pi-serial default|disable-bt|miniuart-bt"
+    fi
     # Set up in the files, but the running kernel still has the old settings: a reboot is pending.
     if [[ ! -e "$SERIAL0" ]] || grep -qE '(^| )console=(serial0|serial1|ttyS0|ttyAMA0),' "$PROC_CMDLINE" 2>/dev/null; then
       say "... but not in effect yet: the Pi has not rebooted since"

@@ -50,11 +50,20 @@ nRF52840 dongle (PCA10059), which the manager flashes for you. The host needs `b
 running, as Raspberry Pi OS has.
 
 **Software.** Docker Engine with the Compose v2 plugin (`docker compose version` must work),
-installed from [Docker's own packages](https://docs.docker.com/engine/install/debian/). On
-Raspberry Pi OS, follow the Debian instructions. Also needed: `bash`, `curl` and `tar`, which
-Raspberry Pi OS already has. Run everything below as a user in the `docker` group
-(`sudo usermod -aG docker "$USER"`, then sign in again). The setup script uses `sudo` only to
-change the Pi's boot settings.
+installed from Docker's own packages. On a Raspberry Pi, KenLens's Pi script does this: it
+brings Raspberry Pi OS up to date, installs Docker and adds you to the `docker` group, and with
+`--prepare-only` installs nothing else.
+
+```bash
+curl -fsSLO https://raw.githubusercontent.com/kenlens-rtls/kenlens-deploy/main/raspberry-pi/kenlens-pi-setup.sh
+bash kenlens-pi-setup.sh --prepare-only
+```
+
+Then sign out and in again, so the `docker` group applies. On another host, follow
+[Docker's instructions](https://docs.docker.com/engine/install/) and run everything below as a
+user in the `docker` group (`sudo usermod -aG docker "$USER"`, then sign in again). Also needed:
+`bash`, `curl` and `tar`, which Raspberry Pi OS already has. The setup script uses `sudo` only
+to change the Pi's boot settings.
 
 **Network.** The host needs:
 
@@ -92,6 +101,9 @@ The script backs each file up first as `config.txt.pre-anchor-bridge` and
 effect only after a reboot. If you reboot, run `./anchor-bridge-setup.sh` once more afterwards to
 start the bridge. If you prefer to make the changes by hand, decline and edit the two files as
 above. `ls -l /dev/serial0` must then show a link to `ttyS0` or `ttyAMA0`.
+
+Once the port is set up, the script no longer asks. To change the Bluetooth choice later, run
+`./anchor-bridge-setup.sh --pi-serial disable-bt` (or `default`, `miniuart-bt`) and reboot.
 
 ## Install
 
