@@ -108,11 +108,11 @@ bash kenlens-pi-setup.sh --host kenlens.local --host 192.168.1.20 --https-port 4
   --wifi-off --non-interactive
 ```
 
-`--version vX.Y.Z` installs a release other than the latest. `--prepare-only` stops after the
-Docker step, for a Pi that will run the [anchor bridge](../anchor-bridge/) or follow the
-[install guide](../README.md#install) by hand. It checks neither the memory nor the SSD: only
-KenLens needs 4 GB and an SSD, and the anchor bridge runs from the SD card of a Pi 3 or 4 in well
-under 1 GB. `bash kenlens-pi-setup.sh --help` lists every option. The script is also in every
+`--version vX.Y.Z` installs a release other than the latest. `--prepare-only` is for a Pi that
+will run the [anchor bridge](../anchor-bridge/): it stops after the Docker step and downloads the
+anchor bridge into `/opt/kenlens-anchor-bridge` instead of installing KenLens. It checks neither
+the memory nor the SSD, and does not warn about Wi-Fi: only KenLens needs 4 GB, an SSD and
+Ethernet, and the anchor bridge runs from the SD card of a Pi 3 or 4 in well under 1 GB. `bash kenlens-pi-setup.sh --help` lists every option. The script is also in every
 release bundle, under `raspberry-pi/`.
 
 Running it again is safe: every step already done is skipped, and an existing installation is

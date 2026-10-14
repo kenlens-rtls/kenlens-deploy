@@ -49,7 +49,7 @@
 #                  soft-blocked
 #
 # Both files are in /boot/firmware (or /boot on an older Raspberry Pi OS) and take effect at the
-# next reboot, which it offers. Writing them needs root: it uses sudo when not run as root.
+# next reboot, which it offers as its last step, once the bridge is installed and started. Writing them needs root: it uses sudo when not run as root.
 #
 # Needs bash and docker with the compose plugin; --update also curl and tar.
 
@@ -438,15 +438,6 @@ prepare_pi() {
 }
 prepare_pi
 
-if $reboot_needed; then
-  if confirm "The serial settings take effect at the next reboot. Reboot now?"; then
-    say "rebooting; when the Pi is back, run ./anchor-bridge-setup.sh again to start the bridge"
-    as_root / reboot
-    exit 0
-  fi
-  say "reboot before creating an anchor on /dev/serial0 (sudo reboot); the bridge starts again by itself"
-fi
-
 # ---------------------------------------------------------------------------
 # Start, and say where the manager is.
 # ---------------------------------------------------------------------------
@@ -458,6 +449,23 @@ docker compose up -d --wait --remove-orphans || die "the bridge did not start; s
 host=$(hostname -I 2>/dev/null | awk '{ print $1 }') || true
 port=$(env_get ANCHOR_BRIDGE_MANAGER_PORT)
 url="https://${host:-<this host>}:${port:-$DEFAULT_MANAGER_PORT}"
+
+# The reboot comes last: the bridge is already installed and comes back by itself (restart policy),
+# and it sees /dev/serial0 appear through the /dev it mounts. The setup token is not printed then:
+# the manager draws a new one on every start, so the one from before the reboot would not work.
+if $reboot_needed; then
+  say "the anchor bridge $(env_get KENLENS_VERSION) is installed; it starts again by itself after the reboot"
+  say "manager: $url"
+  say "setup token, after the reboot: cd $DIR && docker compose logs anchor-bridge | grep \"setup token\""
+  if confirm "The serial settings take effect at the next reboot. Reboot now?"; then
+    say "rebooting"
+    as_root / reboot
+    exit 0
+  fi
+  say "reboot before creating an anchor on /dev/serial0: sudo reboot"
+  exit 0
+fi
+
 token=""
 for (( i = 0; i < TOKEN_WAIT_SECONDS; i++ )); do
   token=$(docker compose logs --no-log-prefix anchor-bridge 2>/dev/null \

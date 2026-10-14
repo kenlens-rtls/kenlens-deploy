@@ -3,20 +3,22 @@
 #
 # Checks the Pi, brings Raspberry Pi OS up to date, installs Docker from Docker's own packages,
 # offers to turn Wi-Fi off when Ethernet is the way in, then downloads a KenLens release into
-# /opt/kenlens, runs its kenlens-setup.sh and starts the stack. Run it as the user you created in
+# /opt/kenlens, runs its kenlens-setup.sh and starts the stack. With --prepare-only it downloads
+# the anchor bridge into /opt/kenlens-anchor-bridge instead, ready for its anchor-bridge-setup.sh. Run it as the user you created in
 # Raspberry Pi Imager, not as root: it uses sudo for the steps that need it. Running it again
 # skips every step already done; it never sets up over an existing installation.
 #
 #   bash kenlens-pi-setup.sh                             # asks for what it needs
-#   bash kenlens-pi-setup.sh --prepare-only              # the Pi and Docker only, no KenLens
+#   bash kenlens-pi-setup.sh --prepare-only              # the Pi, Docker and the anchor bridge
 #   bash kenlens-pi-setup.sh --host kenlens.lan --https-port 443 --wifi-off --non-interactive
 #
 # Options:
-#   --prepare-only       Stop once the Pi is prepared and Docker installed; install nothing else.
-#                        For a Pi that runs the anchor bridge: neither the 4 GB of memory nor
-#                        the SSD KenLens needs is checked.
+#   --prepare-only       For a Pi that runs the anchor bridge: prepare the Pi, install Docker and
+#                        download the anchor bridge, but no KenLens. Neither the 4 GB of memory
+#                        nor the SSD KenLens needs is checked, and Wi-Fi is not warned about.
 #   --dir <path>         Where KenLens is installed; /opt/kenlens unless given. Upgrades must run
-#                        from the same place: Docker names the database volume after it.
+#                        from the same place: Docker names the database volume after it. With
+#                        --prepare-only, where the anchor bridge goes; /opt/kenlens-anchor-bridge.
 #   --version <vX.Y.Z>   The release to install; the latest one unless given.
 #   --host <name|ip>     A name or address browsers and anchors use to reach this Pi; repeat for
 #                        several. Unless given, it offers <hostname>.local and this Pi's address.
@@ -41,7 +43,8 @@
 #   docker       the service enabled at boot; this user added to the docker group
 #   Wi-Fi        turned off, only after asking or with --wifi-off (NetworkManager's radio switch,
 #                which outlasts a reboot; `sudo nmcli radio wifi on` undoes it)
-#   <dir>        created and given to this user; the release bundle unpacked into it
+#   <dir>        created and given to this user; the release bundle, or with --prepare-only its
+#                anchor-bridge folder, unpacked into it
 #
 # Needs bash, sudo, curl and tar, which Raspberry Pi OS has.
 
@@ -66,7 +69,7 @@ readonly CONFLICTING_PACKAGES=(docker.io docker-doc docker-compose podman-docker
 readonly READY_WAIT_SECONDS=120
 
 prepare_only=false
-dir="/opt/kenlens"
+dir=""
 version=""
 hosts=()
 setup_args=()
@@ -99,6 +102,10 @@ while [[ $# -gt 0 ]]; do
     *)                 die "unknown option '$1' (see --help)" ;;
   esac
 done
+
+if [[ -z "$dir" ]]; then
+  if $prepare_only; then dir="/opt/kenlens-anchor-bridge"; else dir="/opt/kenlens"; fi
+fi
 
 (( EUID != 0 )) || die "run this as the user you log in with, not as root or with sudo: it uses sudo itself" \
                        "where it must, and adds that user to the docker group"
@@ -243,8 +250,13 @@ done
 if [[ -z "$route_dev" ]]; then
   say "warning: no default route: this Pi cannot reach the internet to download Docker images"
 elif is_wireless "$route_dev"; then
-  say "warning: this Pi reaches the network over Wi-Fi ($route_dev). Ethernet is recommended:"
-  say "         connect it and run this again to turn Wi-Fi off."
+  # Only the KenLens server answers the anchors; a Pi that runs the anchor bridge is fine on Wi-Fi.
+  if $prepare_only; then
+    say "on Wi-Fi ($route_dev)"
+  else
+    say "warning: this Pi reaches the network over Wi-Fi ($route_dev). Ethernet is recommended:"
+    say "         connect it and run this again to turn Wi-Fi off."
+  fi
 elif [[ ${#wifi_up[@]} -eq 0 ]]; then
   say "on Ethernet ($route_dev), Wi-Fi off"
 else
@@ -263,9 +275,72 @@ else
   fi
 fi
 
+take_dir() { # take_dir — $dir created if missing, and writable by this user
+  if [[ ! -d "$dir" ]]; then
+    sudo mkdir -p "$dir" || die "could not create $dir"
+  fi
+  if [[ ! -w "$dir" ]]; then
+    sudo chown "$USER:" "$dir" || die "could not give $dir to $USER"
+  fi
+}
+
+stage=""
+trap '[[ -z "$stage" ]] || rm -rf "$stage"' EXIT
+fetch_bundle() { # fetch_bundle [folder] — the release bundle, or one folder of it, unpacked into $dir
+  local folder=${1:-} asset
+  if [[ -z "$version" ]]; then
+    version=$(curl -fsSL "$GITHUB_API_URL/repos/$DEPLOY_REPO/releases/latest" \
+              | sed -n 's/.*"tag_name": *"\([^"]*\)".*/\1/p') \
+      || die "could not get the latest release from $GITHUB_API_URL (no network, or GitHub's rate" \
+             "limit for unauthenticated requests); name the release instead: --version vX.Y.Z"
+    [[ "$version" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]] || die "no latest release at $GITHUB_API_URL/repos/$DEPLOY_REPO"
+  fi
+  asset="kenlens-deploy-$version.tar.gz"
+  say "downloading $asset"
+  stage=$(mktemp -d "${TMPDIR:-/tmp}/kenlens-pi-setup.XXXXXX")
+  curl -fsSL -o "$stage/$asset" "$KENLENS_DOWNLOAD_URL/$version/$asset" \
+    || die "could not download $KENLENS_DOWNLOAD_URL/$version/$asset; is $version a published release?"
+  # Readable by the containers, whose users are not this one.
+  if [[ -n "$folder" ]]; then
+    ( umask 022 && tar -xzf "$stage/$asset" -C "$dir" --strip-components=2 "kenlens-deploy-$version/$folder" ) \
+      || die "$asset did not unpack its $folder/ into $dir"
+  else
+    ( umask 022 && tar -xzf "$stage/$asset" -C "$dir" --strip-components=1 ) \
+      || die "$asset did not unpack into $dir"
+  fi
+}
+
+bundle_version() { # bundle_version — the release the bundle in $dir was unpacked from
+  sed -n 's/^KENLENS_VERSION=//p' "$dir/.env.example" 2>/dev/null | head -n 1
+}
+
 if $prepare_only; then
+  # ---------------------------------------------------------------------------
+  step "Downloading the anchor bridge"
+  # ---------------------------------------------------------------------------
+
+  take_dir
+  if [[ -x "$dir/anchor-bridge-setup.sh" ]]; then
+    say "the anchor bridge of $(bundle_version) is already in $dir"
+    [[ -z "$version" ]] || say "warning: --version $version ignored; the bridge already in $dir is used"
+  else
+    [[ -z "$(ls -A "$dir")" ]] \
+      || die "$dir is not empty and holds no anchor bridge; choose another place with --dir"
+    fetch_bundle anchor-bridge
+    [[ -x "$dir/anchor-bridge-setup.sh" ]] || die "kenlens-deploy-$version.tar.gz holds no anchor bridge"
+    say "unpacked the anchor bridge of $version into $dir"
+  fi
+
   echo
-  say "the Pi is ready for KenLens; follow the install guide from 'Install' to put it on"
+  say "the Pi is ready for KenLens."
+  if ! id -nG | tr ' ' '\n' | grep -qx docker; then
+    say "Log out and back in first, so the docker group applies. Then:"
+  fi
+  say "  cd $dir && ./anchor-bridge-setup.sh     to install the anchor bridge,"
+  say "or follow the install guide for a full system install."
+  if [[ -e "$REBOOT_REQUIRED" ]]; then
+    say "The system update asks for a reboot; anchor-bridge-setup.sh offers one at its end."
+  fi
   exit 0
 fi
 
@@ -279,37 +354,16 @@ if [[ -f "$dir/.env" ]]; then
   exit 0
 fi
 
-if [[ ! -d "$dir" ]]; then
-  sudo mkdir -p "$dir" || die "could not create $dir"
-fi
-if [[ ! -w "$dir" ]]; then
-  sudo chown "$USER:" "$dir" || die "could not give $dir to $USER"
-fi
-
+take_dir
 if [[ -x "$dir/kenlens-setup.sh" ]]; then
   # A previous run unpacked the bundle and stopped before kenlens-setup.sh finished.
-  say "the bundle of $(sed -n 's/^KENLENS_VERSION=//p' "$dir/.env.example" 2>/dev/null | head -n 1) is already in $dir"
+  say "the bundle of $(bundle_version) is already in $dir"
   [[ -z "$version" ]] || say "warning: --version $version ignored; the bundle already in $dir is used"
 else
   [[ -z "$(ls -A "$dir")" ]] \
     || die "$dir is not empty and holds no KenLens bundle; choose another place with --dir"
-  if [[ -z "$version" ]]; then
-    version=$(curl -fsSL "$GITHUB_API_URL/repos/$DEPLOY_REPO/releases/latest" \
-              | sed -n 's/.*"tag_name": *"\([^"]*\)".*/\1/p') \
-      || die "could not get the latest release from $GITHUB_API_URL (no network, or GitHub's rate" \
-             "limit for unauthenticated requests); name the release instead: --version vX.Y.Z"
-    [[ "$version" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]] || die "no latest release at $GITHUB_API_URL/repos/$DEPLOY_REPO"
-  fi
-  asset="kenlens-deploy-$version.tar.gz"
-  say "downloading $asset"
-  stage=$(mktemp -d "${TMPDIR:-/tmp}/kenlens-pi-setup.XXXXXX")
-  trap 'rm -rf "$stage"' EXIT
-  curl -fsSL -o "$stage/$asset" "$KENLENS_DOWNLOAD_URL/$version/$asset" \
-    || die "could not download $KENLENS_DOWNLOAD_URL/$version/$asset; is $version a published release?"
-  # Readable by the containers, whose users are not this one.
-  ( umask 022 && tar -xzf "$stage/$asset" -C "$dir" --strip-components=1 ) \
-    || die "$asset did not unpack into $dir"
-  [[ -x "$dir/kenlens-setup.sh" ]] || die "$asset holds no kenlens-setup.sh: not a KenLens deploy bundle"
+  fetch_bundle
+  [[ -x "$dir/kenlens-setup.sh" ]] || die "kenlens-deploy-$version.tar.gz holds no kenlens-setup.sh: not a KenLens deploy bundle"
   say "unpacked $version into $dir"
 fi
 
