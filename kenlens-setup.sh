@@ -78,6 +78,7 @@
 #   config/ntp/                    the site's own time servers for the anchors, if any
 #                                  (created empty; see chrony/chrony.conf)
 #   data/keys/                     the server's key ring (created empty, mode 0700)
+#   data/web-tls/                  the uploaded organisation web certificate (created empty, mode 0700)
 #   .env                           KENLENS_VERSION, KENLENS_HTTPS_PORT, KENLENS_HOST,
 #                                  KENLENS_ANCHOR_DOMAINS, KENLENS_TAG_HEIGHT_METRES,
 #                                  KENLENS_DB_TUNE_MEMORY
@@ -764,6 +765,19 @@ if [[ ! -d data/keys ]]; then
     docker run --rm --user 0 --entrypoint /bin/sh -v "$DIR/data:/d" "$MOSQUITTO_IMAGE" \
       -c 'mkdir /d/keys && chmod 0700 /d/keys' \
       || die "could not create data/keys in the root-owned data/ through $MOSQUITTO_IMAGE"
+  fi
+fi
+
+# Issue #244 — the uploaded web certificate. The server writes it; creating it here keeps it private
+# (a missing bind-mount source is created by Docker as root, mode 0755).
+if [[ ! -d data/web-tls ]]; then
+  if [[ ! -e data || -w data ]]; then
+    mkdir -p data/web-tls
+    chmod 0700 data/web-tls
+  else
+    docker run --rm --user 0 --entrypoint /bin/sh -v "$DIR/data:/d" "$MOSQUITTO_IMAGE" \
+      -c 'mkdir /d/web-tls && chmod 0700 /d/web-tls' \
+      || die "could not create data/web-tls in the root-owned data/ through $MOSQUITTO_IMAGE"
   fi
 fi
 

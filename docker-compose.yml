@@ -28,6 +28,9 @@
 # everything except that password, which then has to be re-entered — for this bundled broker,
 # with "Use the embedded broker" on the MQTT settings page, which makes the server a new one.
 #
+# data/web-tls/ is the organisation web certificate uploaded on Configuration -> Certificates
+# (#244), its key encrypted with the key ring: back it up with data/keys.
+#
 # Nothing here configures the broker the server connects to (issue #238). A database with no
 # MQTT settings is given this bundled broker — mqtt-broker:8883, TLS, user kenlens, with a
 # password the server makes up — and the MQTT settings page changes it from then on.
@@ -225,6 +228,8 @@ services:
       - ./data/firmware:/app/data/firmware
       # The Data Protection key ring; see the header.
       - ./data/keys:/app/data/keys
+      # Issue #244 — the uploaded web certificate. Writable: config/secrets is read-only.
+      - ./data/web-tls:/app/data/web-tls
       - kenlens-broker-control:/app/data/broker-control
       - ./logs:/app/logs
       - ./config/dataprotection:/app/config/dataprotection:ro

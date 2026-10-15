@@ -126,6 +126,17 @@ on the page, which downloads the CA and shows the steps for that browser (the sa
 first Admin** — KenLens ships no default account, and this page closes as soon as one user
 exists. Sign in with it and follow the first-run wizard.
 
+**Use your organisation's web certificate.** If your browsers already trust your own CA, upload a
+certificate it issued on **Configuration → Certificates**: a PKCS#12 file with its password (what
+pfSense exports from **System → Cert. Manager**), or a PEM certificate with its chain plus a PEM key.
+KenLens serves it from the next connection, with no restart, for every name it covers — a
+`*.asgard.qc.ca` certificate covers `kenlens.asgard.qc.ca`, provided that name resolves to this
+host in DNS. It should also be one of the install's `--host` values, so the page lists it and
+anchors and consoles use it. Any other name, and an IP address, keeps the
+KenLens certificate. The upload is kept in `data/web-tls/`, encrypted with the key ring in
+`data/keys/`; back the two up together. Remove it from the same page to go back to the KenLens
+certificate.
+
 **Upgrade.** One command fetches a release's bundle, checks it, applies it over this directory
 and restarts the stack. `.env` is only added to (its version line changes, and a release may add
 a setting it introduced), and nothing under `config/` or `data/` is touched:
