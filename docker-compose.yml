@@ -205,11 +205,12 @@ services:
       AnchorConsole__RootCertificatePath: /app/config/secrets/db-ca.crt
       # Issue #242: the KenLens CA, offered to browsers to trust (https://<host>:8443/trust).
       KenLensCa__CertificatePath: /app/config/secrets/db-ca.crt
-      # The height tags are carried at, in metres, which the planar solve holds fixed. 1.2 m
-      # unless .env says otherwise (KENLENS_TAG_HEIGHT_METRES, or kenlens-setup.sh --tag-height).
-      # A height off by 20 cm moves a position by centimetres at the room's centre and by a few
-      # tens of centimetres directly under an anchor (issue #248).
-      Positioning__AssumedTagHeightMetres: ${KENLENS_TAG_HEIGHT_METRES:-1.2}
+      # Tags are solved in three dimensions unless .env sets KENLENS_TAG_HEIGHT_METRES (or
+      # kenlens-setup.sh --tag-height did): that height selects the planar fallback, which holds
+      # every tag at it (ADR-0015, issue #394). Unset renders an empty value, which the server
+      # reads as no height. There is deliberately no Positioning__SolveSpace line: the height alone
+      # chooses the solve.
+      Positioning__AssumedTagHeightMetres: ${KENLENS_TAG_HEIGHT_METRES:-}
     healthcheck:
       # The image's own HEALTHCHECK probes :8080, which Production does not bind. -k skips
       # only the name check for this loopback probe.

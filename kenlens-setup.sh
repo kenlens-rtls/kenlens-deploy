@@ -29,10 +29,10 @@
 #                        install. Only the host side of the mapping: inside the container the
 #                        server always listens on 8443. Remembered in .env as KENLENS_HTTPS_PORT;
 #                        to change it later run --https-port again, then docker compose up -d.
-#   --tag-height <m>     The height tags are carried at, in metres (KENLENS_TAG_HEIGHT_METRES).
-#                        Optional: 1.2 m unless .env says otherwise. A height off by 20 cm moves
-#                        a position by centimetres at the room's centre and by a few tens of
-#                        centimetres directly under an anchor.
+#   --tag-height <m>     Select the planar fallback: hold every tag at this height, in metres
+#                        (KENLENS_TAG_HEIGHT_METRES). Without it tags are solved in three
+#                        dimensions, which needs anchors mounted at least 1 m above the highest
+#                        tagged object. To go back to 3D, remove the line from .env.
 #   --version            Alone, with no value: print the release installed here (the
 #                        KENLENS_VERSION .env pins) and exit; nothing else on the line runs.
 #   --version <vX.Y.Z>   On a fresh install, the release .env pins. Defaults to the one in
@@ -429,7 +429,8 @@ else
   fi
 fi
 
-# Optional since issue #248: docker-compose.yml holds the tag at 1.2 m unless .env says otherwise.
+# Optional: with no height the server solves tags in three dimensions (issue #394); a height
+# selects the planar fallback.
 if [[ -n "$tag_height" ]]; then
   stored_height=$(env_get KENLENS_TAG_HEIGHT_METRES)
   if [[ -n "$stored_height" ]]; then

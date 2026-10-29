@@ -183,6 +183,16 @@ decline and edit the two files as above. `ls -l /dev/serial0` must then show a l
 Once the port is set up, the script no longer asks. To change the Bluetooth choice later, run
 `./anchor-bridge-setup.sh --pi-serial disable-bt` (or `default`, `miniuart-bt`) and reboot.
 
+**The onboard Bluetooth link loses bytes now and then.** On a Pi 3 the Bluetooth controller
+reaches the system over a serial link with a small buffer, and under load that buffer overruns.
+The count is `oe:` on the Bluetooth UART's line in `sudo cat /proc/tty/driver/ttyAMA` (with
+`miniuart-bt`, in `/proc/tty/driver/serial` instead), and the kernel log shows
+`Bluetooth: hci0: Frame reassembly failed` when it notices. A damaged report can look like a
+device that does not exist, or arrive with an impossible signal strength, so the bridge reports a
+device only once it has heard the same advert twice in a row, drops a report it cannot trust, and
+logs a warning, at most every ten minutes, when it discarded one. Nothing needs doing on the Pi; the
+counter only tells you how lossy the link is.
+
 ## Install
 
 On a [prepared Raspberry Pi](#raspberry-pi-preparation-recommended), the bridge is already in
