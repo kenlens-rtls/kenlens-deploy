@@ -193,6 +193,15 @@ device only once it has heard the same advert twice in a row, drops a report it 
 logs a warning, at most every ten minutes, when it discarded one. Nothing needs doing on the Pi; the
 counter only tells you how lossy the link is.
 
+**The onboard Bluetooth can stop scanning for good until a reboot.** On a Pi 3 the controller has been
+seen to answer every scan start with *busy* (`org.bluez.Error.InProgress` on the manager page and in
+the console's BLE tab; `hci0: Opcode 0x200c failed: -16` in the kernel log) for days, while the anchor
+stays online and keeps reporting positions. Restarting the bridge or the Bluetooth service does not
+free it, and neither does powering the adapter off; only a reboot does. After ten minutes the manager
+row says **Not scanning for …** with the reason and that advice, the bridge logs it once, and KenLens
+raises a *Bluetooth not scanning* alert on the anchor. Reboot the Pi. The wedge recurs on a lossy
+link; the counter above says how lossy yours is.
+
 ## Install
 
 On a [prepared Raspberry Pi](#raspberry-pi-preparation-recommended), the bridge is already in
