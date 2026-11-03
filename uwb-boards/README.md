@@ -1,8 +1,8 @@
 # UWB boards: flash and configure
 
 Each KenLens release ships the UWB firmware for two development boards, the **DWM1001-DEV** and the
-**DWM3001CDK**: as tags, and as the daughter board of an anchor, such as one behind the
-[anchor bridge](../anchor-bridge/). This guide writes the firmware to a new board from a computer,
+**DWM3001CDK**, and for KenLens's own **kencee** and **kencee U2** boards: as tags, and as the
+daughter board of an anchor, such as one behind the [anchor bridge](../anchor-bridge/). This guide writes the firmware to a new board from a computer,
 then gives the board its role from KenLens.
 
 - [What you need](#what-you-need)
@@ -24,9 +24,12 @@ then gives the board its role from KenLens.
 
 ## What you need
 
-- The board, and a **USB cable** to the connector of its built-in **J-Link debugger**. Both boards
-  have one; the board's documentation marks which connector it is. No separate programmer is
-  needed.
+- The board, and a **USB cable** to the connector of its built-in **J-Link debugger**. Both
+  development boards have one; the board's documentation marks which connector it is. No separate
+  programmer is needed.
+- A **kencee** or **kencee U2** has no built-in debugger: it needs a **J-Link probe** on its debug
+  pads — on the kencee U2, the J4 pads, through a pogo-pin jig. Flash it as below, with the probe in
+  place of the board's own J-Link.
 - A Windows, macOS or Linux computer with:
   - [SEGGER J-Link Software](https://www.segger.com/downloads/jlink/), which talks to the debugger;
   - one of Nordic's programming tools: **nRF Connect for Desktop** with its **Programmer** app,
@@ -48,7 +51,8 @@ you run and download, for your board, the files whose names end in:
 | `-<board>-ota.bin` | The same firmware for updates over Bluetooth. KenLens already has it: see [Updating a board later](#updating-a-board-later) |
 | `SHA256SUMS` | The checksum of every file |
 
-`<board>` is `dwm1001dev` or `dwm3001cdk`. A file for the other board does not start on yours.
+`<board>` is `dwm1001dev`, `dwm3001cdk`, `kencee` or `kenceeu2`. A file for another board does not
+start on yours.
 Check the downloads where you saved them:
 
 ```bash
@@ -139,7 +143,7 @@ people who manage the UWB network.
 ## Updating a board later
 
 No cable is needed after the first flash. Every KenLens release carries the `-ota.bin` firmware for
-both boards and puts it into **Configuration → Firmware** by itself when it starts, uploaded by
+every board above and puts it into **Configuration → Firmware** by itself when it starts, uploaded by
 **KenLens vX.Y.Z**. Create a rollout there to update tags or anchors' daughter boards over
 Bluetooth. Nothing is updated until you start one.
 
