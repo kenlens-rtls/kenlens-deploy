@@ -187,6 +187,12 @@ services:
       # Where the server tells the broker whether the anonymous listener is on. The plugin
       # admin's password is config/secrets/mqtt-admin-password.
       Mqtt__Embedded__ControlDirectory: /app/data/broker-control
+      # Story 6.7 — the server's side of the backup service: the control volume, where it writes the
+      # settings and schedule and reads the results, the list of backups included. It does not mount
+      # the backup directory: it sets the key backups are encrypted to, and must not also be able to
+      # read them. The display path is only what the panel calls that directory.
+      Backup__ControlDirectory: /app/data/backup-control
+      Backup__DestinationDisplayPath: ${KENLENS_BACKUP_DIR:-./backups}
       DataProtection__KeysPath: /app/data/keys
       DataProtection__CertificatePath: /app/config/dataprotection/key-ring.crt
       DataProtection__CertificateKeyPath: /app/config/dataprotection/key-ring.key
@@ -232,6 +238,7 @@ services:
       # Issue #244 — the uploaded web certificate. Writable: config/secrets is read-only.
       - ./data/web-tls:/app/data/web-tls
       - kenlens-broker-control:/app/data/broker-control
+      - kenlens-backup-control:/app/data/backup-control
       - ./logs:/app/logs
       - ./config/dataprotection:/app/config/dataprotection:ro
       - ./config/anchor-ca:/app/config/anchor-ca:ro
@@ -239,7 +246,42 @@ services:
       # required one is missing or empty.
       - ./config/secrets:/app/config/secrets:ro
 
+  # Story 6.7 — scheduled whole-installation backups. The server's image, another program: it alone sees the
+  # whole directory (config/ca included, read-only), and it writes only to the backup directory. The server
+  # tells it the schedule through kenlens-backup-control and reads the results there too: this service lists
+  # the backup directory into it, since the server, which sets the key, does not mount the backups.
+  # The agent's defaults are this file's layout: host postgres (the certificate names it, so verify-full
+  # holds), the db-password and db-ca.crt under config/secrets, user and database kenlens.
+  kenlens-backup:
+    image: ${KENLENS_IMAGE_REPO:-ghcr.io/kenlens-rtls}/kenlens-server:${KENLENS_VERSION:?set KENLENS_VERSION in .env, e.g. v0.1.30}
+    restart: unless-stopped
+    entrypoint: ["dotnet", "/app/backup/kenlens-backup.dll"]
+    # The image's HEALTHCHECK curls the server's port, which this service does not serve. Its health is
+    # the heartbeat the server watches, status/heartbeat.json in the control volume: written once the
+    # agent has recovered, then every minute. Not `disable: true` (#448): with an image HEALTHCHECK
+    # under it, Compose v2.33's `up --wait` fails on that service though everything is up.
+    healthcheck:
+      test: ["CMD-SHELL", "find /kenlens/control/status/heartbeat.json -mmin -3 | grep -q ."]
+      interval: 10s
+      timeout: 3s
+      start_period: 60s
+      retries: 3
+    # A stop cancels a running copy: the agent kills pg_basebackup, and the temporary slot ends with its connection.
+    stop_grace_period: 30s
+    depends_on:
+      postgres:
+        condition: service_healthy
+    environment:
+      KENLENS_VERSION: ${KENLENS_VERSION}
+      BACKUP_DESTINATION_HOST_PATH: ${KENLENS_BACKUP_DIR:-./backups}
+      BACKUP_PG_BASEBACKUP: /usr/lib/postgresql/17/bin/pg_basebackup
+    volumes:
+      - .:/kenlens/install:ro
+      - ${KENLENS_BACKUP_DIR:-./backups}:/kenlens/backups
+      - kenlens-backup-control:/kenlens/control
+
 volumes:
   kenlens-postgres-data:
   kenlens-mosquitto-data:
   kenlens-broker-control:
+  kenlens-backup-control:

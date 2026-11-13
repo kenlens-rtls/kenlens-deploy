@@ -11,6 +11,8 @@
 #   ./kenlens-setup.sh --rotate broker                   # re-issue one item
 #   ./kenlens-setup.sh --update latest                   # upgrade to a release (or --update vX.Y.Z)
 #   ./kenlens-setup.sh --version                         # the release installed here
+#   ./kenlens-setup.sh --restore backups/kenlens-<time>-<release> --key <file>
+#                                                        # put a scheduled backup back, and check it
 #
 # Options:
 #   --host <name|ip>     A name or IPv4/IPv6 address browsers and anchors use to reach this
@@ -58,6 +60,17 @@
 #                        newest two backups there are kept and older ones deleted. They hold
 #                        every secret of the install: copy them off this host.
 #   --no-backup          With --update: take no backup.
+#   --restore <dir>      Restore a scheduled backup — one kenlens-<time>-<release>/ directory the
+#                        backup service wrote — into this directory, start KenLens and check that
+#                        it works. Run it from the bundle of the backup's release, set up or not:
+#                        this directory's own .env, config/ and data/ are moved to
+#                        before-restore-<time>/, never deleted. Nothing changes until the backup has
+#                        decrypted and verified. Needs --key; takes no option but --key and --force.
+#                        Pulls the images it needs when they are missing; otherwise it needs no
+#                        network. See the wiki's Back up and restore page.
+#   --key <file>         With --restore: the private key the backup was encrypted to.
+#   --force              With --restore: replace a database that is already here. Nothing of it is
+#                        kept.
 #   -h, --help           Show this help.
 #
 # Idempotent: a secret, key or certificate that already exists is never replaced unless its
@@ -127,6 +140,10 @@ version=""
 update_tag=""
 backup=true
 backup_dir=""
+restore_src=""
+restore_key=""
+force=false
+failed_image=""     # the image ensure_images could not pull
 readonly DEPLOY_REPO="kenlens-rtls/kenlens-deploy"
 # Overridable so a test can stand GitHub in; the convention scripts/publish-deploy-bundle.sh set.
 readonly GITHUB_API_URL="${GITHUB_API_URL:-https://api.github.com}"
@@ -149,6 +166,13 @@ show_version() { # the KENLENS_VERSION .env pins, alone on stdout — what --upd
   printf '%s\n' "$installed"
 }
 
+abs_path() { # abs_path <path> → absolute, from where the script was started; no symlink is resolved
+  local p=$1
+  [[ "$p" == /* ]] || p="$PWD/$p"
+  while [[ "$p" == */ && "$p" != / ]]; do p=${p%/}; done
+  printf '%s' "$p"
+}
+
 while [[ $# -gt 0 ]]; do
   case "$1" in
     --host)            [[ $# -ge 2 ]] || die "--host needs a value"; hosts+=("$2"); shift 2 ;;
@@ -159,8 +183,13 @@ while [[ $# -gt 0 ]]; do
     --version)         if [[ $# -lt 2 || "$2" == -* ]]; then show_version; exit 0; fi
                        version="$2"; shift 2 ;;
     --update)          [[ $# -ge 2 && -n "$2" ]] || die "--update needs a release tag (vX.Y.Z) or 'latest'"; update_tag="$2"; shift 2 ;;
-    --backup-dir)      [[ $# -ge 2 && -n "$2" ]] || die "--backup-dir needs a path"; backup_dir=$(realpath -m -- "$2"); shift 2 ;;
+    --backup-dir)      [[ $# -ge 2 && -n "$2" ]] || die "--backup-dir needs a path"; backup_dir=$(realpath -m -s -- "$2"); shift 2 ;;
     --no-backup)       backup=false; shift ;;
+    --restore)         [[ $# -ge 2 && -n "$2" ]] || die "--restore needs a backup's directory (kenlens-<time>-<release>)"
+                       restore_src=$(abs_path "$2"); shift 2 ;;
+    --key)             [[ $# -ge 2 && -n "$2" ]] || die "--key needs the private key file the backup was encrypted to"
+                       restore_key=$(abs_path "$2"); shift 2 ;;
+    --force)           force=true; shift ;;
     --rotate)          [[ $# -ge 2 ]] || die "--rotate needs an item: $ROTATABLE"
                        [[ " $ROTATABLE " == *" $2 "* ]] || die "cannot rotate '$2'; items: $ROTATABLE"
                        rotate[$2]=1; shift 2 ;;
@@ -251,13 +280,34 @@ update_backup() { # update_backup <current-version> — changes nothing on failu
   [[ -n "$backup_dir" ]] || backup_dir="$DIR/backups"
   [[ "$from" =~ ^[A-Za-z0-9._-]+$ ]] || from=unknown
   # An archive of the directory must not contain the backups, wherever they are kept inside it.
-  exclude=(--exclude=./backups --exclude=./logs)
-  [[ "$backup_dir/" != "$DIR/"* ]] || exclude+=("--exclude=./${backup_dir#"$DIR/"}")
+  # The scheduled backups (Story 6.7) go to KENLENS_BACKUP_DIR, ./backups unless .env says otherwise.
+  local skip=(backups logs) sched rel other keep
+  sched=$(env_get KENLENS_BACKUP_DIR)
+  if [[ -n "$sched" ]]; then
+    # -s: DIR is the logical path (pwd), so compare without resolving symlinks on either side.
+    [[ "$sched" == /* ]] && sched=$(realpath -m -s -- "$sched") || sched=$(realpath -m -s -- "$DIR/$sched")
+    [[ "$sched/" != "$DIR/"* || "$sched" == "$DIR" ]] || skip+=("${sched#"$DIR/"}")
+  fi
+  [[ "$backup_dir/" != "$DIR/"* ]] || skip+=("${backup_dir#"$DIR/"}")
+  # Each entry once, and none inside another: the measurement subtracts every entry's size.
+  exclude=(); local kept=()
+  for rel in "${skip[@]}"; do
+    keep=true
+    for other in "${skip[@]}"; do
+      [[ "$other" != "$rel" && "$rel/" == "$other/"* ]] && keep=false
+    done
+    [[ " ${kept[*]} " != *" $rel "* ]] || keep=false
+    ! $keep || kept+=("$rel")
+  done
+  for rel in "${kept[@]}"; do exclude+=("--exclude=./$rel"); done
+  skip=("${kept[@]}")
 
   # Room for both archives, counted uncompressed, before anything is stopped.
   db_kib=$(docker compose run -T --rm --no-deps --entrypoint du postgres -sk "$PGDATA_DIR" | awk '{ print $1; exit }') \
     && dir_kib=$(docker run --rm --user 0 --entrypoint /bin/sh -v "$DIR:/b:ro" "$MOSQUITTO_IMAGE" \
-                   -c 'cd /b && du -sk . | cut -f1') \
+                   -c 'cd /b && t=$(du -sk . | cut -f1) && for p in "$@"; do
+                         [ -e "$p" ] && t=$((t - $(du -sk "$p" | cut -f1)))
+                       done; echo "$t"' sh "${skip[@]}") \
     && [[ "$db_kib" =~ ^[0-9]+$ && "$dir_kib" =~ ^[0-9]+$ ]] \
     || die "could not measure the database and this directory for the backup; nothing was changed." \
            "To upgrade without one: --no-backup"
@@ -380,13 +430,451 @@ update() { # update <tag|latest> — never returns
   exit 0
 }
 
+# ---------------------------------------------------------------------------
+# --restore — put a scheduled backup (Story 6.7) back into this directory, start it and prove it
+# serves (Story 6.8, docs/superpowers/specs/2026-11-10-restore-from-backup-design.md).
+#
+# Steps 1-6 change nothing, and every refusal there says so. From step 7 the directory changes, and
+# a failure says what it then holds (restore_failed). Every container given a path gets it through
+# --mount, which refuses a missing source where -v would create it as a root-owned directory.
+# ---------------------------------------------------------------------------
+readonly RESTORE_READY_SECONDS=120
+restore_work=""          # .restore-<time>/: the decrypted backup, every secret of the install in plaintext
+restore_aside=""         # before-restore-<time>/, once this directory's own files are in it
+restore_stopped=false    # once step 7's docker compose down has succeeded
+restore_db_emptied=false
+restore_pg_volume=""
+
+manifest_get() { # manifest_get <manifest.json> <top-level key> → its string value, or nothing
+  # The agent writes the manifest indented by two (BackupContract.Json), one key per line.
+  sed -n "s/^  \"$2\": \"\([^\"]*\)\",\{0,1\}\$/\1/p" "$1" | head -n 1
+}
+
+manifest_part_bytes() { # manifest_part_bytes <manifest.json> <part file> → its size in bytes, or nothing
+  awk -v want="\"$2\"," '
+    $1 == "\"file\":"  { part = $2 }
+    $1 == "\"bytes\":" && part == want { sub(/,$/, "", $2); print $2; part = "" }' "$1"
+}
+
+compose_volume() { # compose_volume <volume> [env-file] → the name compose gives it in this directory's project
+  local out
+  out=$(docker compose ${2:+--env-file "$2"} config 2>/dev/null) || return 0
+  # awk reads to the end: an early exit would fail the pipe under pipefail (#249).
+  awk -v key="  $1:" '
+    /^[^ ]/               { top = ($0 == "volumes:"); want = 0; next }
+    top && $0 == key      { want = 1; next }
+    top && want && /^    name: / { print $2; want = 0 }
+    top && /^  [^ ]/      { want = 0 }' <<<"$out"
+}
+
+compose_project() { # compose_project → the name of this directory's compose project, or nothing
+  local out
+  out=$(docker compose config 2>/dev/null) || return 0
+  # Quoted when it reads as a number ("2024"). sed reads to the end, as compose_volume's awk does (#249).
+  sed -n 's/^name: "\{0,1\}\([a-z0-9][a-z0-9_-]*\)"\{0,1\}$/\1/p' <<<"$out"
+}
+
+root_sh() { # root_sh <docker run args...> — /bin/sh as root with no network; mounts, then image and script
+  docker run --rm --network none --user 0 --entrypoint /bin/sh "$@"
+}
+
+ensure_images() { # ensure_images <image...> — pulls each one missing; false, with failed_image set, when a pull fails
+  local image
+  for image in "$@"; do
+    docker image inspect "$image" >/dev/null 2>&1 && continue
+    say "pulling $image"
+    docker pull -q "$image" >/dev/null || { failed_image=$image; return 1; }
+  done
+}
+
+restore_cleanup() { # the EXIT trap from step 6: the plaintext never outlives the script
+  [[ -n "$restore_work" && -d "$restore_work" ]] || return 0
+  root_sh --mount "type=bind,src=$restore_work,dst=/w" "$MOSQUITTO_IMAGE" -c 'rm -rf /w/parts /w/files' >/dev/null 2>&1 || true
+  rm -f "$restore_work/restored.env"
+  rmdir "$restore_work" 2>/dev/null \
+    || say "warning: could not delete $restore_work, which holds the decrypted backup: delete it (it is root's)"
+  restore_work=""
+}
+
+restore_failed() { # restore_failed <message...> — from step 7 on: what failed, and what the directory now holds
+  echo "kenlens-setup: $*" >&2
+  if $restore_stopped; then
+    echo "kenlens-setup: the restore stopped part-way, with KenLens stopped." >&2
+  else
+    echo "kenlens-setup: the restore stopped part-way." >&2
+  fi
+  if [[ -n "$restore_aside" ]]; then
+    echo "kenlens-setup: this directory's own files from before are in $restore_aside/; nothing there is deleted." >&2
+  fi
+  if $restore_db_emptied; then
+    echo "kenlens-setup: the database volume $restore_pg_volume may hold part of a database." >&2
+  fi
+  if $restore_db_emptied || $force; then
+    echo "kenlens-setup: fix the cause, then run --restore again with --force." >&2
+  else
+    echo "kenlens-setup: fix the cause, then run --restore again." >&2
+  fi
+  exit 1
+}
+
+restore() { # restore <backup-dir> — never returns
+  local src=$1 manifest name release finished outcome bundled pinned v f broker_volume pg_state
+  manifest="$src/manifest.json"
+
+  # 1. The backup.
+  for f in "$DIR" "$src" "$restore_key"; do
+    [[ "$f" != *,* ]] || die "$f: Docker cannot mount a path with a comma in it; rename it. Nothing was changed."
+  done
+  [[ -d "$src" ]] || die "$src is not a directory: --restore takes one backup's directory," \
+                         "kenlens-<time>-<release>. Nothing was changed."
+  [[ -f "$manifest" ]] || die "$src holds no manifest.json, so it is not a scheduled backup" \
+                              "(kenlens-<time>-<release>/). Nothing was changed."
+  outcome=$(manifest_get "$manifest" outcome)
+  name=$(manifest_get "$manifest" name)
+  release=$(manifest_get "$manifest" release)
+  finished=$(manifest_get "$manifest" finished_utc)
+  [[ "$outcome" == succeeded ]] \
+    || die "$manifest records a backup that did not finish (outcome: ${outcome:-none}); restore another one." \
+           "Nothing was changed."
+  [[ "$release" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]] || die "$manifest names no release (vX.Y.Z). Nothing was changed."
+
+  # 2. The release: this bundle's, and the one .env pins when the directory is set up.
+  [[ -f .env.example ]] || die ".env.example is missing from $DIR — is this a KenLens deploy bundle? Nothing was changed."
+  bundled=$(sed -n 's/^KENLENS_VERSION=//p' .env.example | head -n 1)
+  pinned=$(env_get KENLENS_VERSION)
+  for v in "$bundled" ${pinned:+"$pinned"}; do
+    [[ "$v" == "$release" ]] \
+      || die "This backup was taken by $release; this directory holds ${v:-an unknown release}." \
+             "Unpack the $release bundle into a directory of its own and run --restore there. Nothing was changed."
+  done
+
+  # 3. The key file.
+  [[ -f "$restore_key" && -r "$restore_key" ]] \
+    || die "the key file $restore_key does not exist or cannot be read. Nothing was changed."
+
+  # 4. The database volume, by the name compose gives it. Compose requires KENLENS_VERSION, which a
+  # directory never set up has no .env for; it is the backup's release either way.
+  export KENLENS_VERSION=$release
+  docker info >/dev/null 2>&1 || die "Docker is not running here (docker info failed). Nothing was changed."
+  restore_pg_volume=$(compose_volume kenlens-postgres-data)
+  broker_volume=$(compose_volume kenlens-mosquitto-data)
+  [[ -n "$restore_pg_volume" && -n "$broker_volume" ]] \
+    || die "docker compose config names no database or broker volume here (run it to see why). Nothing was changed."
+  # The volumes are the compose project's, and compose names the project after the directory: an
+  # installation in another directory of the same name shares them, and `docker compose down` here would
+  # stop its containers. Refused even with --force. -ef compares inodes, so a path through a symlink is
+  # still this directory. A docker ps that fails refuses, as the probe below does.
+  local project listed cid cdir other=""
+  project=$(compose_project)
+  [[ -n "$project" ]] || die "docker compose config names no project here (run it to see why). Nothing was changed."
+  listed=$(docker ps -a --filter "label=com.docker.compose.project=$project" \
+             --format '{{.ID}} {{.Label "com.docker.compose.project.working_dir"}}') \
+    || die "could not list the containers of compose project $project (docker ps failed; see above)." \
+           "Nothing was changed."
+  while read -r cid cdir; do
+    [[ -n "$cid" ]] || continue
+    if [[ -z "$cdir" || ! "$cdir" -ef "$DIR" ]]; then other=${cdir:-"a directory it does not record"}; break; fi
+  done <<<"$listed"
+  [[ -z "$other" ]] \
+    || die "another installation, in $other, has containers in compose project $project, which is this" \
+           "directory's: --restore here would stop them and replace that installation's database. Run" \
+           "--restore in a directory of another name. Nothing was changed."
+  ensure_images "$MOSQUITTO_IMAGE" \
+    || die "could not pull $failed_image: pull it while this machine has a connection. Nothing was changed."
+  # A plain container, not `docker compose run postgres`: in a directory never set up, compose would
+  # create every missing bind-mount source (config/tls/postgres.key …) as a root-owned directory.
+  # Three answers, so that a probe that fails for another reason refuses rather than reads as empty.
+  pg_state=absent
+  if docker volume inspect "$restore_pg_volume" >/dev/null 2>&1; then
+    pg_state=$(root_sh --mount "type=volume,src=$restore_pg_volume,dst=/v,readonly" "$MOSQUITTO_IMAGE" \
+                 -c 'if [ -e /v/PG_VERSION ]; then echo holds; else echo empty; fi') || pg_state=""
+  fi
+  case "$pg_state" in
+    absent|empty) ;;
+    holds)
+      $force || die "The database volume $restore_pg_volume already holds a database. --restore replaces it" \
+                    "and keeps nothing of it: run again with --force. The volume is compose project" \
+                    "$project's, and an installation in another directory named $project whose containers" \
+                    "were removed (docker compose down) would share it. Nothing was changed."
+      say "--force: the database in $restore_pg_volume will be replaced" ;;
+    *) die "could not look inside the database volume $restore_pg_volume (docker run failed; see above)." \
+           "Nothing was changed." ;;
+  esac
+
+  # 5. Space. One container sees this directory and the volume, so a filesystem that holds both is
+  # counted once, with both needs added. A volume not there yet is measured where it will be, on an
+  # anonymous volume: one created here, outside compose, would not be compose's, and `down -v` would
+  # leave it behind. Not read-only, which Docker Engine 27 refuses for an anonymous volume (#449); it is
+  # empty and goes with the container. Sizes are the encrypted parts', a little more than the plaintext.
+  local db_bytes files_bytes need_here need_volume df_out fs_here free_here fs_volume free_volume
+  local volume_mount="type=volume,dst=/v"
+  if docker volume inspect "$restore_pg_volume" >/dev/null 2>&1; then
+    volume_mount="type=volume,src=$restore_pg_volume,dst=/v,readonly"
+  fi
+  db_bytes=$(manifest_part_bytes "$manifest" db.tar.kbk)
+  files_bytes=$(manifest_part_bytes "$manifest" files.tar.kbk)
+  [[ "$db_bytes" =~ ^[0-9]+$ && "$files_bytes" =~ ^[0-9]+$ ]] \
+    || die "$manifest does not list db.tar.kbk and files.tar.kbk with their sizes. Nothing was changed."
+  # KiB, rounded up. Here: both parts decrypted, and the files extracted. In the volume: the database.
+  need_here=$(( (db_bytes + 2 * files_bytes + 1023) / 1024 ))
+  need_volume=$(( (db_bytes + 1023) / 1024 ))
+  df_out=$(root_sh --mount "type=bind,src=$DIR,dst=/i,readonly" --mount "$volume_mount" \
+                   "$MOSQUITTO_IMAGE" -c 'df -Pk /i /v | tail -n 2') \
+    || die "could not measure the free space in $DIR and in $restore_pg_volume. Nothing was changed."
+  read -r fs_here _ _ free_here _ <<<"$(sed -n 1p <<<"$df_out")"
+  read -r fs_volume _ _ free_volume _ <<<"$(sed -n 2p <<<"$df_out")"
+  [[ "$free_here" =~ ^[0-9]+$ && "$free_volume" =~ ^[0-9]+$ ]] \
+    || die "could not read the free space in $DIR and in $restore_pg_volume (df said: $df_out). Nothing was changed."
+  if [[ "$fs_here" == "$fs_volume" ]]; then
+    need_here=$(( need_here + need_volume ))
+    need_volume=0
+  fi
+  (( free_here > need_here )) \
+    || die "the restore needs up to $(( need_here / 1024 )) MiB free in $DIR, which has $(( free_here / 1024 )) MiB." \
+           "Free some space. Nothing was changed."
+  (( need_volume == 0 || free_volume > need_volume )) \
+    || die "the database needs up to $(( need_volume / 1024 )) MiB free where Docker keeps its volumes," \
+           "which has $(( free_volume / 1024 )) MiB. Free some space. Nothing was changed."
+
+  # 6. Decrypt with this release's own image, then read what will be restored before using any of it.
+  local image out stamp restored_env backup_dest dest_path restored_volume
+  local -a images=()
+  image=$(docker compose config --images 2>/dev/null | grep -m 1 '/kenlens-server:' || true)
+  [[ -n "$image" ]] || die "docker compose config names no kenlens-server image here. Nothing was changed."
+  ensure_images "$image" \
+    || die "could not pull $failed_image: pull it while this machine has a connection. Nothing was changed."
+  stamp=$(date -u +%Y%m%dT%H%M%SZ)
+  restore_work="$DIR/.restore-$stamp"
+  trap restore_cleanup EXIT
+  mkdir -m 0700 "$restore_work" || die "could not create $restore_work. Nothing was changed."
+  say "decrypting $name (no network)"
+  if ! out=$(docker run --rm --network none --user 0 --entrypoint dotnet \
+               --mount "type=bind,src=$src,dst=/in,readonly" \
+               --mount "type=bind,src=$restore_key,dst=/key/private.pem,readonly" \
+               --mount "type=bind,src=$restore_work,dst=/out" \
+               "$image" /app/backup/kenlens-backup.dll decrypt --key /key/private.pem --in /in --out /out/parts 2>&1); then
+    sed 's/^/  /' <<<"$out" >&2
+    die "$name did not decrypt (above). Nothing was changed."
+  fi
+  sed -n 's/^ok /  ok /p' <<<"$out"
+  # A backup is trusted as the bundle is (docs/SECURITY.md): nobody signs it, and whoever can write to
+  # the share can make one. So files.tar is unpacked, as root to keep every owner and mode, into
+  # .restore-<time>/files/ by a container that sees nothing else, and checked there: step 10 moves only
+  # .env, config/ and data/ into this directory, whose kenlens-setup.sh step 12 runs. A link inside them
+  # is the backup's own (the backup service writes link entries); one that leads out is refused, and so
+  # is config or data as a link, anything that is not a file, directory or link (a device, a FIFO), and a
+  # setuid or setgid file. The container gets files.tar as one read-only file and files/ as the only
+  # place it writes: busybox tar does not clean a hard link's target, so with parts/ in the same mount
+  # a crafted entry hard-linked to ../parts/db.tar would become a second name for the decrypted database,
+  # which step 10 would move into this directory and the cleanup would not remove. With nothing but
+  # files/ on that mount the link fails (EXDEV, or no such file), and tar's exit status refuses.
+  local verdict env_owner
+  local link_check='for l; do
+      t=$(readlink "$l")
+      case "$t" in /*|..|../*|*/..|*/../*) printf "%s, a link to \"%s\"\n" "${l#./}" "$t" ;; esac
+    done'
+  mkdir -m 0700 "$restore_work/files" || die "could not create $restore_work/files. Nothing was changed."
+  verdict=$(root_sh --mount "type=bind,src=$restore_work/parts/files.tar,dst=/files.tar,readonly" \
+                    --mount "type=bind,src=$restore_work/files,dst=/f" "$MOSQUITTO_IMAGE" -c \
+    'tar --numeric-owner -xpf /files.tar -C /f && cd /f || exit 1
+     for e in * .*; do
+       case "$e" in .|..|.env|config|data) continue ;; esac
+       if [ -e "$e" ] || [ -L "$e" ]; then echo "refuse $e, which is not .env, config/ or data/"; exit 0; fi
+     done
+     if [ -L .env ]; then echo "refuse .env, which is a link"; exit 0; fi
+     if [ ! -e .env ]; then echo "refuse no .env file"; exit 0; fi
+     if [ ! -f .env ]; then echo "refuse .env, which is not a regular file"; exit 0; fi
+     for d in config data; do
+       if [ -L "$d" ] || { [ -e "$d" ] && [ ! -d "$d" ]; }; then echo "refuse $d, which is not a directory"; exit 0; fi
+     done
+     out=$(find . ! -type f ! -type d ! -type l) || exit 1
+     if [ -n "$out" ]; then echo "refuse $(printf "%s\n" "$out" | sed -n "1s|^\./||p"), which is not a file, directory or link"; exit 0; fi
+     out=$(find . ! -type d \( -perm -4000 -o -perm -2000 \)) || exit 1
+     if [ -n "$out" ]; then echo "refuse $(printf "%s\n" "$out" | sed -n "1s|^\./||p"), which is setuid or setgid"; exit 0; fi
+     out=$(find . -type l -exec sh -c "$1" sh {} +) || exit 1
+     if [ -n "$out" ]; then echo "refuse $(printf "%s\n" "$out" | sed -n 1p)"; exit 0; fi
+     owner=$(stat -c %u .env) || exit 1
+     echo "ok $owner"' sh "$link_check") \
+    || die "could not unpack the backup's files.tar (above). Nothing was changed."
+  case "$verdict" in
+    "ok "[0-9]*) env_owner=${verdict#ok } ;;
+    "refuse "*)  die "the backup's files.tar holds ${verdict#refuse }. --restore writes only .env, config/ and" \
+                     "data/ from a backup, and no link that leads out of them. Nothing was changed." ;;
+    *)           die "could not check the backup's files.tar (it said: ${verdict:-nothing}). Nothing was changed." ;;
+  esac
+  # Root's .env means the installation that took the backup ran as root; its files are root's, and step
+  # 12's setup, run as this user, could not read them.
+  [[ "$env_owner" != 0 || "$(id -u)" == 0 ]] \
+    || die "the backup's .env belongs to root: the installation that took it ran as root. Run --restore" \
+           "with sudo. Nothing was changed."
+  restored_env="$restore_work/restored.env"
+  { root_sh --mount "type=bind,src=$restore_work,dst=/r,readonly" "$MOSQUITTO_IMAGE" \
+      -c 'cat /r/files/.env' > "$restored_env" 2>/dev/null && [[ -s "$restored_env" ]]; } \
+    || die "the backup's .env is empty or cannot be read. Nothing was changed."
+  # A share the restored .env writes backups to must be mounted: Docker would put an empty root-owned
+  # directory in its place. ./backups, the default, is created below by this release's setup.
+  backup_dest=$(sed -n 's/^KENLENS_BACKUP_DIR=//p' "$restored_env" | tail -n 1)
+  case "$backup_dest" in
+    ""|./backups|./backups/) dest_path="" ;;
+    /*)                      dest_path=$backup_dest ;;
+    ./*)                     dest_path="$DIR/${backup_dest#./}" ;;
+    *)                       dest_path="" ;;   # a bare name is a Docker volume
+  esac
+  [[ -z "$dest_path" || -d "$dest_path" ]] \
+    || die "the restored .env writes backups to $backup_dest, which does not exist here: Docker would create" \
+           "an empty directory there, as root. Mount the share there, or create the directory owned by you," \
+           "then run --restore again. Nothing was changed."
+  restored_volume=$(compose_volume kenlens-postgres-data "$restored_env")
+  [[ -n "$restored_volume" ]] || die "docker compose could not read the restored .env. Nothing was changed."
+  [[ "$restored_volume" == "$restore_pg_volume" ]] \
+    || die "the restored .env gives this installation another compose project (database volume" \
+           "$restored_volume, not $restore_pg_volume): run --restore in a directory named" \
+           "${restored_volume%_kenlens-postgres-data}. Nothing was changed."
+  mapfile -t images < <(docker compose --env-file "$restored_env" config --images 2>/dev/null | sort -u)
+  (( ${#images[@]} > 0 )) || die "docker compose could not read the restored .env. Nothing was changed."
+  ensure_images "${images[@]}" \
+    || die "could not pull $failed_image, which the restored installation runs: pull it while this machine has" \
+           "a connection, then run --restore again. Nothing was changed."
+
+  # 7. Stop. From here the directory changes, and restore_failed says what it then holds.
+  say "restoring $name into $DIR"
+  docker compose down || restore_failed "docker compose down failed (above)."
+  restore_stopped=true
+
+  # 8. The broker's users. Its plugin admin's password is the one the restored config/ replaces:
+  # kept, the broker fails its own healthcheck. KenLens re-creates every broker user at start.
+  if docker volume inspect "$broker_volume" >/dev/null 2>&1; then
+    docker volume rm "$broker_volume" >/dev/null || restore_failed "could not remove the broker's volume $broker_volume."
+  fi
+
+  # 9. This directory's own files are moved aside, never deleted. Through a root container: config/
+  # holds files of the containers' users, and data/ can be root's.
+  local uid gid
+  local -a items=()
+  uid=$(id -u)
+  gid=$(id -g)
+  for f in .env config data; do
+    if [[ -e "$f" || -L "$f" ]]; then items+=("$f"); fi
+  done
+  if (( ${#items[@]} > 0 )); then
+    restore_aside="before-restore-$stamp"
+    root_sh --mount "type=bind,src=$DIR,dst=/w" "$MOSQUITTO_IMAGE" -c \
+      'a=$1; owner=$2; shift 2
+       mkdir "/w/$a" && chown "$owner" "/w/$a" && chmod 0700 "/w/$a" || exit 1
+       for f; do mv "/w/$f" "/w/$a/" || exit 1; done' sh "$restore_aside" "$uid:$gid" "${items[@]}" \
+      || restore_failed "could not move ${items[*]} aside into $restore_aside/."
+    say "moved this directory's ${items[*]} aside into $restore_aside/"
+  fi
+
+  # 10. The backup's .env, config/ and data/, as step 6 unpacked and checked them, renamed into this
+  # directory on one mount, so each file keeps its owner and mode: postgres.key stays uid 70,
+  # mqtt-broker.key uid 1883. None is moved onto a path that is there: mv would put it inside. The old
+  # operator's files (whoever owned .env) then become this user's, unless this user is root; a .env of
+  # root's was refused at step 6 unless this run is root's too.
+  root_sh --mount "type=bind,src=$DIR,dst=/w" "$MOSQUITTO_IMAGE" -c \
+    's=/w/$1/files; shift
+     for f in .env config data; do
+       [ -e "$s/$f" ] || [ -L "$s/$f" ] || continue
+       if [ -e "/w/$f" ] || [ -L "/w/$f" ]; then echo "kenlens-setup: $f is in the way; nothing replaces it" >&2; exit 1; fi
+       mv "$s/$f" "/w/$f" || exit 1
+     done
+     old=$(stat -c %u /w/.env) || exit 1
+     if [ "$1" = 0 ] || [ "$old" = 0 ] || [ "$old" = "$1" ]; then exit 0; fi
+     for p in /w/.env /w/config /w/data; do
+       [ ! -e "$p" ] || find "$p" -xdev -user "$old" -exec chown -h "$1:$2" {} \; || exit 1
+     done' sh ".restore-$stamp" "$uid" "$gid" \
+    || restore_failed "could not put the backup's files back into $DIR."
+
+  # 11. The database, into the emptied volume. Compose creates the volume when it is missing (the
+  # files it binds are in place now), so it is compose's and `down -v` removes it with the rest.
+  docker compose create postgres >/dev/null \
+    || restore_failed "docker compose could not create the database volume (docker compose create postgres)."
+  restore_db_emptied=true
+  root_sh --mount "type=volume,src=$restore_pg_volume,dst=/v" \
+          --mount "type=bind,src=$restore_work,dst=/r,readonly" "$MOSQUITTO_IMAGE" \
+    -c 'rm -rf /v/* /v/.[!.]* && tar --numeric-owner -xpf /r/parts/db.tar -C /v' \
+    || restore_failed "could not put the database back into $restore_pg_volume."
+
+  # 12. The plaintext is no longer needed. This release's setup then adds what a backup does not hold
+  # (backups/, owned by this user) and replaces nothing that is there, as it does after --update.
+  restore_cleanup
+  say "preparing $DIR with this release's setup"
+  "$DIR/kenlens-setup.sh" --non-interactive </dev/null 2>&1 | sed 's/^/  /' \
+    || restore_failed "this release's setup failed (above)."
+
+  # 13-14. Start it, then check that it works. Every check runs; the ones that fail are listed together.
+  local -a failed=()
+  local ready=false audit="" audit_rows="" holds i
+  say "starting KenLens"
+  if ! docker compose up -d --wait --remove-orphans; then
+    failed+=("services: docker compose up -d --wait failed; docker compose ps and docker compose logs say which service and why")
+  else
+    # Asked inside the server container, as its healthcheck asks /health/live: on a new machine the
+    # installation's names still point at the old one, and an uploaded organisation certificate would
+    # not chain to the KenLens CA.
+    for (( i = 0; i < RESTORE_READY_SECONDS; i += 2 )); do
+      if docker compose exec -T kenlens-server curl -fsSk https://localhost:8443/health/ready >/dev/null 2>&1; then
+        ready=true
+        break
+      fi
+      sleep 2
+    done
+    $ready || failed+=("ready: /health/ready did not answer ready within ${RESTORE_READY_SECONDS}s (docker compose logs kenlens-server says why). Most often the restored MQTT settings name a broker this machine cannot reach: sign in and change them on Configuration → MQTT broker.")
+    audit=$(docker compose exec -T kenlens-server dotnet /app/audit-verify/kenlens-audit-verify.dll verify 2>&1) || true
+    audit_rows=$(sed -n 's/^OK: audit chain valid (\([0-9]*\) rows.*/\1/p' <<<"$audit")
+    [[ -n "$audit_rows" ]] || failed+=("audit chain: $(grep -m1 -E '^(FAIL|verify):|Exception' <<<"$audit" || tail -n 1 <<<"${audit:-the verifier printed nothing}")")
+  fi
+  for f in web mqtt-broker; do
+    openssl verify -CAfile config/ca/kenlens-ca.crt "config/tls/$f.crt" >/dev/null 2>&1 \
+      || failed+=("certificates: config/tls/$f.crt does not chain to the restored config/ca/kenlens-ca.crt")
+  done
+
+  # 15. What it holds, for the operator to recognise; nothing is compared.
+  holds=$(docker compose exec -T postgres psql -U kenlens -d kenlens -tAc \
+    "SELECT (SELECT count(*) FROM users) || ' users, ' || (SELECT count(*) FROM anchors) || ' anchors, '
+       || (SELECT count(*) FROM floors) || ' floors, '
+       || (SELECT count(*) FROM zones WHERE archived_at IS NULL) || ' zones; newest position '
+       || coalesce(to_char((SELECT max(ts) FROM position_history) AT TIME ZONE 'UTC', 'YYYY-MM-DD HH24:MI') || ' UTC', 'none')" \
+    2>/dev/null) && [[ -n "$holds" ]] || holds="(could not be read)"
+
+  if (( ${#failed[@]} > 0 )); then
+    for f in "${failed[@]}"; do echo "kenlens-setup: FAILED $f" >&2; done
+    echo "kenlens-setup: $name is restored into $DIR, but the checks above failed. Fix their cause, then" \
+         "docker compose up -d --wait. It holds: $holds" >&2
+    [[ -z "$restore_aside" ]] \
+      || echo "kenlens-setup: this directory's own files from before are in $restore_aside/." >&2
+    exit 1
+  fi
+  say "restored $name, taken by $release, finished $finished"
+  say "verified: services healthy; ready; certificates chain to the restored CA; audit chain valid ($audit_rows rows)"
+  say "holds: $holds"
+  say "next: sign in with a user of the restored installation (a fresh install's Admin is gone)"
+  say "      delete the key file from this machine: $restore_key"
+  say "      point the installation's names at this machine if it replaces another"
+  if [[ -n "$restore_aside" ]]; then
+    say "      once KenLens works: docker run --rm -v \"$DIR:/w\" $MOSQUITTO_IMAGE rm -rf /w/$restore_aside"
+  fi
+  say "KenLens may raise Backup failed (no backup in 36 hours) until its next backup; Run backup now" \
+      "on Configuration → System clears it"
+  exit 0
+}
+
 if [[ -n "$update_tag" ]]; then
   [[ ${#hosts[@]} -eq 0 && ${#domains[@]} -eq 0 && $no_domain == false && -z "$tag_height" \
-     && -z "$version" && -z "$https_port" && ${#rotate[@]} -eq 0 ]] \
+     && -z "$version" && -z "$https_port" && ${#rotate[@]} -eq 0 \
+     && -z "$restore_src" && -z "$restore_key" && $force == false ]] \
     || die "--update takes no other option but --backup-dir and --no-backup"
   if ! $backup && [[ -n "$backup_dir" ]]; then die "--backup-dir and --no-backup contradict each other"; fi
   update "$update_tag"
 fi
+if [[ -n "$restore_src" ]]; then
+  [[ ${#hosts[@]} -eq 0 && ${#domains[@]} -eq 0 && $no_domain == false && -z "$tag_height" \
+     && -z "$version" && -z "$https_port" && ${#rotate[@]} -eq 0 && $backup == true && -z "$backup_dir" ]] \
+    || die "--restore takes no other option but --key and --force"
+  [[ -n "$restore_key" ]] || die "--restore needs --key <file>: the private key the backup was encrypted to"
+  restore "$restore_src"
+fi
+[[ -z "$restore_key" && $force == false ]] || die "--key and --force only go with --restore"
 [[ $backup == true && -z "$backup_dir" ]] || die "--backup-dir and --no-backup only go with --update"
 
 # ---------------------------------------------------------------------------
@@ -780,6 +1268,18 @@ if [[ ! -d data/web-tls ]]; then
       -c 'mkdir /d/web-tls && chmod 0700 /d/web-tls' \
       || die "could not create data/web-tls in the root-owned data/ through $MOSQUITTO_IMAGE"
   fi
+fi
+
+# Story 6.7 — the scheduled backups' directory, written by the backup service. Created here, by the
+# operator, so Docker does not create it as root (a root-owned backups/ makes the next --update fail
+# to chmod it). KENLENS_BACKUP_DIR names it when it is not ./backups; a custom one is the operator's.
+sched_dir=$(env_get KENLENS_BACKUP_DIR)
+if [[ -n "$sched_dir" ]]; then   # an explicit ./backups is the default, written out
+  [[ "$sched_dir" == /* ]] && sched_dir=$(realpath -m -s -- "$sched_dir") || sched_dir=$(realpath -m -s -- "$DIR/$sched_dir")
+fi
+if [[ ( -z "$sched_dir" || "$sched_dir" == "$DIR/backups" ) && ! -d backups ]]; then
+  mkdir -p backups
+  chmod 0700 backups
 fi
 
 # Site time servers for the ntp service. Readable by chrony's user, which re-reads it on

@@ -149,6 +149,10 @@ It backs the installation up first, into `backups/`, stopping the stack while it
 backup off this host: it holds every secret of the installation. See
 [Back up and restore](https://github.com/kenlens-rtls/kenlens-deploy/wiki/Back-up-and-restore).
 
+**Restore.** `./kenlens-setup.sh --restore <backup> --key <key file>` puts a scheduled backup back,
+on this machine or another one, and checks that it works. See
+[Restore a scheduled backup](https://github.com/kenlens-rtls/kenlens-deploy/wiki/Back-up-and-restore#restore-a-scheduled-backup).
+
 ## Uninstall
 
 ```bash
