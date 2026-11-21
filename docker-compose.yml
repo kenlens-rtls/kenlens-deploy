@@ -211,11 +211,11 @@ services:
       AnchorConsole__RootCertificatePath: /app/config/secrets/db-ca.crt
       # Issue #242: the KenLens CA, offered to browsers to trust (https://<host>:8443/trust).
       KenLensCa__CertificatePath: /app/config/secrets/db-ca.crt
-      # Tags are solved in three dimensions unless .env sets KENLENS_TAG_HEIGHT_METRES (or
-      # kenlens-setup.sh --tag-height did): that height selects the planar fallback, which holds
-      # every tag at it (ADR-0015, issue #394). Unset renders an empty value, which the server
-      # reads as no height. There is deliberately no Positioning__SolveSpace line: the height alone
-      # chooses the solve.
+      # Used only while the database holds no tag-height setting (the first start after an upgrade):
+      # the server copies it in. Once a setting is stored it is ignored and the server logs a
+      # reminder to remove it (#450); importing a configuration archive that has no tag height
+      # keeps the stored setting. The height is set on Configuration → System. Unset renders an
+      # empty value, meaning no height.
       Positioning__AssumedTagHeightMetres: ${KENLENS_TAG_HEIGHT_METRES:-}
     healthcheck:
       # The image's own HEALTHCHECK probes :8080, which Production does not bind. -k skips

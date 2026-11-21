@@ -31,10 +31,6 @@
 #                        install. Only the host side of the mapping: inside the container the
 #                        server always listens on 8443. Remembered in .env as KENLENS_HTTPS_PORT;
 #                        to change it later run --https-port again, then docker compose up -d.
-#   --tag-height <m>     Select the planar fallback: hold every tag at this height, in metres
-#                        (KENLENS_TAG_HEIGHT_METRES). Without it tags are solved in three
-#                        dimensions, which needs anchors mounted at least 1 m above the highest
-#                        tagged object. To go back to 3D, remove the line from .env.
 #   --version            Alone, with no value: print the release installed here (the
 #                        KENLENS_VERSION .env pins) and exit; nothing else on the line runs.
 #   --version <vX.Y.Z>   On a fresh install, the release .env pins. Defaults to the one in
@@ -93,8 +89,7 @@
 #   data/keys/                     the server's key ring (created empty, mode 0700)
 #   data/web-tls/                  the uploaded organisation web certificate (created empty, mode 0700)
 #   .env                           KENLENS_VERSION, KENLENS_HTTPS_PORT, KENLENS_HOST,
-#                                  KENLENS_ANCHOR_DOMAINS, KENLENS_TAG_HEIGHT_METRES,
-#                                  KENLENS_DB_TUNE_MEMORY
+#                                  KENLENS_ANCHOR_DOMAINS, KENLENS_DB_TUNE_MEMORY
 #
 # Owners: postgres.key and db-password belong to uid 70 (the Postgres image's user),
 # mqtt-broker.key to uid 1883 (Mosquitto's). Without root the script sets them through the
@@ -133,7 +128,6 @@ readonly KEY_RING="config/dataprotection/key-ring"
 hosts=()
 domains=()
 no_domain=false
-tag_height=""
 https_port=""
 readonly DEFAULT_HTTPS_PORT=8443
 version=""
@@ -179,7 +173,12 @@ while [[ $# -gt 0 ]]; do
     --domain)          [[ $# -ge 2 ]] || die "--domain needs a value"; domains+=("$2"); shift 2 ;;
     --no-domain)       no_domain=true; shift ;;
     --https-port)      [[ $# -ge 2 ]] || die "--https-port needs a value"; https_port="$2"; shift 2 ;;
-    --tag-height)      [[ $# -ge 2 ]] || die "--tag-height needs a value"; tag_height="$2"; shift 2 ;;
+    # Issue #450. Refused here, before anything is written. A KENLENS_TAG_HEIGHT_METRES an older
+    # install has in .env is left alone: the server copies it into the database on its first start.
+    --tag-height|--tag-height=*)
+                       die "--tag-height is gone: set the tag height on Configuration → System" \
+                           "(https://<host>:<port>/admin/configuration/system). Without one, tags are" \
+                           "solved in three dimensions." ;;
     --version)         if [[ $# -lt 2 || "$2" == -* ]]; then show_version; exit 0; fi
                        version="$2"; shift 2 ;;
     --update)          [[ $# -ge 2 && -n "$2" ]] || die "--update needs a release tag (vX.Y.Z) or 'latest'"; update_tag="$2"; shift 2 ;;
@@ -860,7 +859,7 @@ restore() { # restore <backup-dir> — never returns
 }
 
 if [[ -n "$update_tag" ]]; then
-  [[ ${#hosts[@]} -eq 0 && ${#domains[@]} -eq 0 && $no_domain == false && -z "$tag_height" \
+  [[ ${#hosts[@]} -eq 0 && ${#domains[@]} -eq 0 && $no_domain == false \
      && -z "$version" && -z "$https_port" && ${#rotate[@]} -eq 0 \
      && -z "$restore_src" && -z "$restore_key" && $force == false ]] \
     || die "--update takes no other option but --backup-dir and --no-backup"
@@ -868,7 +867,7 @@ if [[ -n "$update_tag" ]]; then
   update "$update_tag"
 fi
 if [[ -n "$restore_src" ]]; then
-  [[ ${#hosts[@]} -eq 0 && ${#domains[@]} -eq 0 && $no_domain == false && -z "$tag_height" \
+  [[ ${#hosts[@]} -eq 0 && ${#domains[@]} -eq 0 && $no_domain == false \
      && -z "$version" && -z "$https_port" && ${#rotate[@]} -eq 0 && $backup == true && -z "$backup_dir" ]] \
     || die "--restore takes no other option but --key and --force"
   [[ -n "$restore_key" ]] || die "--restore needs --key <file>: the private key the backup was encrypted to"
@@ -914,20 +913,6 @@ else
     port_changed=true
   elif [[ -z "$stored_port" ]]; then
     new_https_port=$effective_port
-  fi
-fi
-
-# Optional: with no height the server solves tags in three dimensions (issue #394); a height
-# selects the planar fallback.
-if [[ -n "$tag_height" ]]; then
-  stored_height=$(env_get KENLENS_TAG_HEIGHT_METRES)
-  if [[ -n "$stored_height" ]]; then
-    [[ "$tag_height" == "$stored_height" ]] \
-      || say "warning: .env already sets KENLENS_TAG_HEIGHT_METRES=$stored_height;" \
-             "--tag-height $tag_height ignored. Edit .env to change it."
-    tag_height=""
-  elif ! [[ "$tag_height" =~ ^[0-9]+(\.[0-9]+)?$ ]] || ! awk -v h="$tag_height" 'BEGIN { exit !(h > 0) }'; then
-    die "tag height '$tag_height' is not a positive number of metres"
   fi
 fi
 
@@ -1052,7 +1037,6 @@ if [[ ! -f .env ]]; then
   env_set KENLENS_VERSION "$version"
   new_env=true
 fi
-[[ -z "$tag_height" ]] || env_set KENLENS_TAG_HEIGHT_METRES "$tag_height"
 [[ -z "$new_https_port" ]] || env_set KENLENS_HTTPS_PORT "$new_https_port"
 [[ -z "$new_hosts" ]]  || env_set KENLENS_HOST "$new_hosts"
 ! $domains_set         || env_set KENLENS_ANCHOR_DOMAINS "$new_domains"
